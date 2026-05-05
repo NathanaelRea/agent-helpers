@@ -1,0 +1,925 @@
+#!/usr/bin/env python3
+import curses
+import errno
+import fcntl
+import os
+import pty
+import re
+import select
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import textwrap
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+DEFAULT_STEP_NAME = "phase"
+ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+HUNK_RE = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
+OUTPUT_TAIL_CHARS = 20000
+COLOR_ADD = 1
+COLOR_DELETE = 2
+COLOR_META = 3
+ATTR_ADD = 0
+ATTR_DELETE = 0
+ATTR_META = 0
+EVENT_MARKERS = {
+    "exec",
+    "message",
+    "reasoning",
+    "thinking",
+    "apply_patch",
+    "update_plan",
+    "spawn_agent",
+    "wait_agent",
+    "read_mcp_resource",
+}
+
+
+@dataclass(frozen=True)
+class DisplayLine:
+    text: str
+    attr: int = 0
+    block_id: str | None = None
+
+
+@dataclass
+class TuiState:
+    expanded_blocks: set[str] = field(default_factory=set)
+    cursor: int = 0
+    scroll: int = 0
+    follow: bool = True
+    pending_g: bool = False
+    output_cache_tail: str = ""
+    output_cache_width: int = -1
+    output_cache_expanded_blocks: frozenset[str] = field(default_factory=frozenset)
+    output_cache_lines: list[DisplayLine] = field(default_factory=list)
+
+
+def require_command(name: str) -> None:
+    if shutil.which(name) is None:
+        print(f"Missing required command: {name}", file=sys.stderr)
+        sys.exit(1)
+
+
+def prompt(default_prompt: str, default: str | None = None) -> str:
+    suffix = f" [{default}]" if default is not None else ""
+    value = input(f"{default_prompt}{suffix}: ").strip()
+    if value:
+        return value
+    if default is not None:
+        return default
+    return ""
+
+
+def prompt_int(label: str, default: int | None = None) -> int:
+    while True:
+        raw = prompt(label, str(default) if default is not None else None)
+        try:
+            value = int(raw)
+        except ValueError:
+            print("Please enter a whole number.")
+            continue
+
+        if value < 1:
+            print("Please enter a number greater than 0.")
+            continue
+
+        return value
+
+
+def list_markdown_files() -> list[str]:
+    cwd = Path.cwd()
+    files = [
+        str(path.relative_to(cwd))
+        for path in cwd.rglob("*.md")
+        if ".git" not in path.parts
+    ]
+    return sorted(files)
+
+
+def choose_plan_file(files: list[str]) -> str:
+    if not files:
+        print("No markdown files found under the current directory.", file=sys.stderr)
+        sys.exit(1)
+
+    result = subprocess.run(
+        ["fzf", "--prompt", "Plan file> "],
+        input="\n".join(files) + "\n",
+        text=True,
+        stdout=subprocess.PIPE,
+        check=False,
+    )
+
+    selected = result.stdout.strip()
+    if result.returncode != 0 or not selected:
+        print("No plan file selected.", file=sys.stderr)
+        sys.exit(1)
+
+    return selected
+
+
+def run_codex_exec(task: str) -> tuple[int, str]:
+    output: list[bytes] = []
+
+    def read_and_capture(fd: int) -> bytes:
+        data = os.read(fd, 1024)
+        output.append(data)
+        return data
+
+    status = pty.spawn(["codex", "exec", task], master_read=read_and_capture)
+    return os.waitstatus_to_exitcode(status), b"".join(output).decode(
+        errors="replace"
+    )
+
+
+def can_use_tui() -> bool:
+    term = os.environ.get("TERM", "")
+    return sys.stdin.isatty() and sys.stdout.isatty() and term not in {"", "dumb"}
+
+
+def clean_for_display(text: str) -> str:
+    text = ANSI_RE.sub("", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(
+        char
+        for char in text
+        if char == "\n" or char == "\t" or ord(char) >= 32
+    )
+
+
+def init_colors() -> None:
+    global ATTR_ADD, ATTR_DELETE, ATTR_META
+
+    if not curses.has_colors():
+        return
+
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+        default_bg = -1
+    except curses.error:
+        default_bg = curses.COLOR_BLACK
+
+    try:
+        curses.init_pair(COLOR_ADD, curses.COLOR_GREEN, default_bg)
+        curses.init_pair(COLOR_DELETE, curses.COLOR_RED, default_bg)
+        curses.init_pair(COLOR_META, curses.COLOR_CYAN, default_bg)
+    except curses.error:
+        return
+
+    ATTR_ADD = curses.color_pair(COLOR_ADD)
+    ATTR_DELETE = curses.color_pair(COLOR_DELETE)
+    ATTR_META = curses.color_pair(COLOR_META) | curses.A_BOLD
+
+
+def hunk_counts(line: str) -> tuple[int, int] | None:
+    match = HUNK_RE.match(line)
+    if match is None:
+        return None
+    return int(match.group(1) or "1"), int(match.group(2) or "1")
+
+
+def wrap_display_line(line: DisplayLine, width: int) -> list[DisplayLine]:
+    if width < 1:
+        return []
+    if not line.text:
+        return [line]
+
+    wrapped = textwrap.wrap(
+        line.text,
+        width=width,
+        replace_whitespace=False,
+        drop_whitespace=False,
+    ) or [""]
+    return [
+        DisplayLine(text, line.attr, line.block_id)
+        for text in wrapped
+    ]
+
+
+def wrapped_lines(text: str, width: int, max_lines: int) -> list[DisplayLine]:
+    if width < 1 or max_lines < 1:
+        return []
+
+    lines: list[DisplayLine] = []
+    for line in clean_for_display(text[-OUTPUT_TAIL_CHARS:]).splitlines() or [""]:
+        lines.extend(wrap_display_line(DisplayLine(line), width))
+
+    return lines[-max_lines:]
+
+
+def is_diff_fragment_start(lines: list[str], index: int) -> bool:
+    return (
+        lines[index].startswith("--- ")
+        and index + 1 < len(lines)
+        and lines[index + 1].startswith("+++ ")
+    )
+
+
+def is_diff_start(lines: list[str], index: int) -> bool:
+    return lines[index].startswith("diff --git ") or is_diff_fragment_start(lines, index)
+
+
+def is_exec_start(lines: list[str], index: int) -> bool:
+    return lines[index].strip() == "exec" and index + 1 < len(lines)
+
+
+def is_diff_metadata(line: str) -> bool:
+    return line.startswith(
+        (
+            "index ",
+            "old mode ",
+            "new mode ",
+            "deleted file mode ",
+            "new file mode ",
+            "similarity index ",
+            "dissimilarity index ",
+            "rename from ",
+            "rename to ",
+            "copy from ",
+            "copy to ",
+            "Binary files ",
+            "GIT binary patch",
+            "literal ",
+            "delta ",
+        )
+    )
+
+
+def parse_diff_block(
+    raw_lines: list[str],
+    start: int,
+    block_id: str,
+) -> tuple[int, list[DisplayLine]]:
+    lines: list[DisplayLine] = []
+    index = start
+    old_remaining = 0
+    new_remaining = 0
+    saw_hunk = False
+
+    while index < len(raw_lines):
+        line = raw_lines[index]
+        if index > start and line.startswith("diff --git "):
+            break
+
+        attr = 0
+        counts = hunk_counts(line)
+        is_part = False
+
+        if old_remaining > 0 or new_remaining > 0:
+            if line.startswith("+") and new_remaining > 0:
+                new_remaining -= 1
+                attr = ATTR_ADD
+                is_part = True
+            elif line.startswith("-") and old_remaining > 0:
+                old_remaining -= 1
+                attr = ATTR_DELETE
+                is_part = True
+            elif line.startswith(" "):
+                old_remaining = max(0, old_remaining - 1)
+                new_remaining = max(0, new_remaining - 1)
+                is_part = True
+            elif not line.startswith("\\"):
+                break
+            else:
+                is_part = True
+        elif counts is not None:
+            old_remaining, new_remaining = counts
+            saw_hunk = True
+            attr = ATTR_META
+            is_part = True
+        elif line.startswith("diff --git ") or is_diff_metadata(line):
+            attr = ATTR_META
+            is_part = True
+        elif line.startswith("--- "):
+            attr = ATTR_DELETE
+            is_part = True
+        elif line.startswith("+++ "):
+            attr = ATTR_ADD
+            is_part = True
+        elif line.startswith("\\") and saw_hunk:
+            is_part = True
+
+        if not is_part:
+            break
+
+        lines.append(DisplayLine(line, attr, block_id))
+        index += 1
+
+    if not lines:
+        return start + 1, [DisplayLine(raw_lines[start], block_id=block_id)]
+
+    return index, lines
+
+
+def parse_exec_block(
+    raw_lines: list[str],
+    start: int,
+    block_id: str,
+) -> tuple[int, list[DisplayLine]]:
+    lines: list[DisplayLine] = [
+        DisplayLine(raw_lines[start], ATTR_META or curses.A_BOLD, block_id)
+    ]
+    index = start + 1
+
+    while index < len(raw_lines):
+        stripped = raw_lines[index].strip()
+        if index > start + 1 and (
+            stripped in EVENT_MARKERS or is_diff_start(raw_lines, index)
+        ):
+            break
+
+        attr = (
+            ATTR_META
+            if stripped in {"command", "output"}
+            or stripped.startswith(("command:", "output:"))
+            else 0
+        )
+        lines.append(DisplayLine(raw_lines[index], attr, block_id))
+        index += 1
+
+    return index, lines
+
+
+def collapsed_diff_summary(lines: list[DisplayLine]) -> str:
+    title = lines[0].text if lines else "diff"
+    if title.startswith("diff --git "):
+        parts = title.split()
+        if len(parts) >= 4:
+            title = f"{parts[2]} -> {parts[3]}"
+    return f"[+] {title} ({len(lines)} lines collapsed)"
+
+
+def collapsed_exec_summary(lines: list[DisplayLine]) -> str:
+    command = "exec"
+    for line in lines[1:]:
+        text = line.text.strip()
+        if (
+            text
+            and text not in {"command", "output"}
+            and not text.startswith(("command:", "output:"))
+        ):
+            command = text
+            break
+    return f"[+] exec: {command} ({len(lines)} lines collapsed)"
+
+
+def build_output_lines(text: str, width: int, state: TuiState) -> list[DisplayLine]:
+    if width < 1:
+        return []
+
+    raw_lines = clean_for_display(text[-OUTPUT_TAIL_CHARS:]).splitlines()
+    output_lines: list[DisplayLine] = []
+    index = 0
+    diff_index = 0
+    exec_index = 0
+
+    while index < len(raw_lines):
+        if is_exec_start(raw_lines, index):
+            block_id = f"exec:{exec_index}:{raw_lines[index + 1]}"
+            next_index, exec_lines = parse_exec_block(raw_lines, index, block_id)
+            if block_id in state.expanded_blocks:
+                first = exec_lines[0]
+                visible_lines = [
+                    DisplayLine(f"[-] {first.text}", first.attr or ATTR_META, block_id),
+                    *exec_lines[1:],
+                ]
+            else:
+                visible_lines = [
+                    DisplayLine(
+                        collapsed_exec_summary(exec_lines),
+                        ATTR_META or curses.A_BOLD,
+                        block_id,
+                    )
+                ]
+
+            for line in visible_lines:
+                output_lines.extend(wrap_display_line(line, width))
+
+            index = max(next_index, index + 1)
+            exec_index += 1
+            continue
+
+        if is_diff_start(raw_lines, index):
+            block_id = f"diff:{diff_index}:{raw_lines[index]}"
+            next_index, diff_lines = parse_diff_block(raw_lines, index, block_id)
+            if block_id in state.expanded_blocks:
+                first = diff_lines[0]
+                expanded_first = DisplayLine(
+                    f"[-] {first.text}",
+                    first.attr or ATTR_META,
+                    block_id,
+                )
+                visible_lines = [expanded_first, *diff_lines[1:]]
+            else:
+                visible_lines = [
+                    DisplayLine(
+                        collapsed_diff_summary(diff_lines),
+                        ATTR_META or curses.A_BOLD,
+                        block_id,
+                    )
+                ]
+
+            for line in visible_lines:
+                output_lines.extend(wrap_display_line(line, width))
+
+            index = max(next_index, index + 1)
+            diff_index += 1
+            continue
+
+        output_lines.extend(wrap_display_line(DisplayLine(raw_lines[index]), width))
+        index += 1
+
+    return output_lines
+
+
+def cached_output_lines(text: str, width: int, state: TuiState) -> list[DisplayLine]:
+    tail = text[-OUTPUT_TAIL_CHARS:]
+    expanded_blocks = frozenset(state.expanded_blocks)
+    if (
+        tail == state.output_cache_tail
+        and width == state.output_cache_width
+        and expanded_blocks == state.output_cache_expanded_blocks
+    ):
+        return state.output_cache_lines
+
+    output_lines = build_output_lines(tail, width, state)
+    state.output_cache_tail = tail
+    state.output_cache_width = width
+    state.output_cache_expanded_blocks = expanded_blocks
+    state.output_cache_lines = output_lines
+    return output_lines
+
+
+def clamp_cursor(state: TuiState, line_count: int, viewport_height: int) -> None:
+    if line_count < 1:
+        state.cursor = 0
+        state.scroll = 0
+        state.follow = True
+        return
+
+    if state.follow:
+        state.cursor = line_count - 1
+    state.cursor = min(max(state.cursor, 0), line_count - 1)
+
+    max_scroll = max(0, line_count - viewport_height)
+    if state.follow:
+        state.scroll = max_scroll
+    elif state.cursor < state.scroll:
+        state.scroll = state.cursor
+    elif state.cursor >= state.scroll + viewport_height:
+        state.scroll = state.cursor - viewport_height + 1
+
+    state.scroll = min(max(state.scroll, 0), max_scroll)
+
+
+def move_cursor(state: TuiState, line_count: int, delta: int) -> None:
+    if line_count < 1:
+        return
+
+    state.cursor = min(max(state.cursor + delta, 0), line_count - 1)
+    state.follow = state.cursor == line_count - 1
+
+
+def move_to_top(state: TuiState) -> None:
+    state.cursor = 0
+    state.follow = False
+
+
+def move_to_bottom(state: TuiState, line_count: int) -> None:
+    if line_count < 1:
+        state.cursor = 0
+        state.scroll = 0
+        state.follow = True
+        return
+
+    state.cursor = line_count - 1
+    state.follow = True
+
+
+def block_start_indexes(lines: list[DisplayLine]) -> list[int]:
+    starts: list[int] = []
+    previous_block: str | None = None
+    for index, line in enumerate(lines):
+        if line.block_id is not None and line.block_id != previous_block:
+            starts.append(index)
+        previous_block = line.block_id
+    return starts
+
+
+def move_to_block(state: TuiState, lines: list[DisplayLine], direction: int) -> None:
+    starts = block_start_indexes(lines)
+    if not starts:
+        return
+
+    if direction > 0:
+        for index in starts:
+            if index > state.cursor:
+                state.cursor = index
+                state.follow = False
+                return
+    else:
+        for index in reversed(starts):
+            if index < state.cursor:
+                state.cursor = index
+                state.follow = False
+                return
+
+
+def toggle_current_block(state: TuiState, lines: list[DisplayLine]) -> None:
+    if not lines:
+        return
+
+    cursor = min(max(state.cursor, 0), len(lines) - 1)
+    block_id = lines[cursor].block_id
+    if block_id is None:
+        return
+
+    for index, line in enumerate(lines):
+        if line.block_id == block_id:
+            state.cursor = index
+            break
+
+    if block_id in state.expanded_blocks:
+        state.expanded_blocks.remove(block_id)
+    else:
+        state.expanded_blocks.add(block_id)
+    state.follow = False
+
+
+def handle_keys(
+    stdscr: curses.window,
+    state: TuiState,
+    lines: list[DisplayLine],
+) -> bool:
+    changed = False
+    while True:
+        key = stdscr.getch()
+        if key == -1:
+            return changed
+
+        if key == ord("g"):
+            if state.pending_g:
+                move_to_top(state)
+                state.pending_g = False
+                changed = True
+            else:
+                state.pending_g = True
+            continue
+
+        state.pending_g = False
+
+        if key == ord("G"):
+            move_to_bottom(state, len(lines))
+            changed = True
+        elif key in (ord("j"), curses.KEY_DOWN):
+            move_cursor(state, len(lines), 1)
+            changed = True
+        elif key in (ord("k"), curses.KEY_UP):
+            move_cursor(state, len(lines), -1)
+            changed = True
+        elif key == ord("}"):
+            move_to_block(state, lines, 1)
+            changed = True
+        elif key == ord("{"):
+            move_to_block(state, lines, -1)
+            changed = True
+        elif key in (ord(" "), ord("\n"), ord("\r"), curses.KEY_ENTER):
+            toggle_current_block(state, lines)
+            changed = True
+        elif key == curses.KEY_RESIZE:
+            changed = True
+
+
+def addstr(window: curses.window, y: int, x: int, text: str, attr: int = 0) -> None:
+    height, width = window.getmaxyx()
+    if y < 0 or y >= height or x < 0 or x >= width:
+        return
+
+    try:
+        window.addstr(y, x, text[: max(0, width - x - 1)], attr)
+    except curses.error:
+        pass
+
+
+def draw_pane(
+    stdscr: curses.window,
+    y: int,
+    x: int,
+    height: int,
+    width: int,
+    title: str,
+    lines: list[DisplayLine],
+    title_attr: int,
+) -> None:
+    if height < 3 or width < 4:
+        return
+
+    pane = stdscr.derwin(height, width, y, x)
+    pane.erase()
+    pane.box()
+    addstr(pane, 0, 2, f" {title} ", title_attr)
+
+    body_width = width - 4
+    body_height = height - 2
+    for index, line in enumerate(lines[:body_height]):
+        addstr(pane, index + 1, 2, line.text[:body_width], line.attr)
+
+
+def layout_dimensions(stdscr: curses.window) -> tuple[int, int, int, int]:
+    height, width = stdscr.getmaxyx()
+    left_width = max(22, min(44, width // 3))
+    if width < 78:
+        left_width = max(18, width // 2)
+    right_x = left_width
+    right_width = width - right_x
+    return height, left_width, right_x, right_width
+
+
+def render_tui(
+    stdscr: curses.window,
+    current_prompt: str,
+    output: str,
+    step: int,
+    total_steps: int,
+    status: str,
+    state: TuiState,
+) -> tuple[int, int, list[DisplayLine]]:
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+
+    if height < 8 or width < 48:
+        addstr(stdscr, 0, 0, "Terminal too small for split view.")
+        stdscr.refresh()
+        return max(1, height), max(20, width), []
+
+    _, left_width, right_x, right_width = layout_dimensions(stdscr)
+    title_attr = curses.A_BOLD
+
+    prompt_lines = wrapped_lines(
+        current_prompt,
+        left_width - 4,
+        height - 2,
+    )
+    output_view_height = max(1, height - 5)
+    output_lines = cached_output_lines(
+        output,
+        right_width - 4,
+        state,
+    )
+    clamp_cursor(state, len(output_lines), output_view_height)
+    position = (
+        f"  line {state.cursor + 1}/{len(output_lines)}"
+        if output_lines
+        else ""
+    )
+    output_header = [
+        DisplayLine(f"{status} {step}/{total_steps}{position}"),
+        DisplayLine(current_prompt),
+        DisplayLine(""),
+    ]
+    visible_output = []
+    for offset, line in enumerate(
+        output_lines[state.scroll : state.scroll + output_view_height]
+    ):
+        attr = line.attr
+        if state.scroll + offset == state.cursor:
+            attr |= curses.A_REVERSE
+        visible_output.append(DisplayLine(line.text, attr, line.block_id))
+
+    draw_pane(
+        stdscr,
+        0,
+        0,
+        height,
+        left_width,
+        "Prompt",
+        prompt_lines,
+        title_attr,
+    )
+    draw_pane(
+        stdscr,
+        0,
+        right_x,
+        height,
+        right_width,
+        "Current output",
+        output_header + visible_output,
+        title_attr,
+    )
+    stdscr.refresh()
+
+    return output_view_height, max(20, right_width - 4), output_lines
+
+
+def resize_pty(fd: int, rows: int, cols: int) -> None:
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    except OSError:
+        pass
+
+
+def spawn_codex_exec(task: str, rows: int, cols: int) -> tuple[int, int]:
+    pid, fd = pty.fork()
+    if pid == 0:
+        try:
+            os.execvp("codex", ["codex", "exec", task])
+        except OSError as error:
+            print(f"Failed to start codex: {error}", file=sys.stderr)
+            os._exit(127)
+
+    resize_pty(fd, rows, cols)
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    return pid, fd
+
+
+def read_pty(fd: int) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        try:
+            chunk = os.read(fd, 4096)
+        except BlockingIOError:
+            break
+        except OSError as error:
+            if error.errno == errno.EIO:
+                break
+            raise
+
+        if not chunk:
+            break
+        chunks.append(chunk)
+
+    return b"".join(chunks)
+
+
+def close_fd(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def run_codex_exec_tui(
+    stdscr: curses.window,
+    task: str,
+    step: int,
+    total_steps: int,
+) -> tuple[int, str]:
+    output: list[bytes] = []
+    output_text = ""
+    state = TuiState()
+
+    def redraw(status: str) -> tuple[int, int, list[DisplayLine]]:
+        return render_tui(
+            stdscr,
+            task,
+            output_text,
+            step,
+            total_steps,
+            status,
+            state,
+        )
+
+    rows, cols, rendered_lines = redraw("running")
+    pid, fd = spawn_codex_exec(task, rows, cols)
+    last_size = (rows, cols)
+    last_screen_size = stdscr.getmaxyx()
+
+    try:
+        while True:
+            screen_size = stdscr.getmaxyx()
+            if screen_size != last_screen_size:
+                last_screen_size = screen_size
+                rows, cols, rendered_lines = redraw("running")
+                if (rows, cols) != last_size:
+                    resize_pty(fd, rows, cols)
+                    last_size = (rows, cols)
+
+            key_changed = handle_keys(stdscr, state, rendered_lines)
+            if key_changed:
+                rows, cols, rendered_lines = redraw("running")
+
+            if (rows, cols) != last_size:
+                resize_pty(fd, rows, cols)
+                last_size = (rows, cols)
+
+            ready, _, _ = select.select([fd], [], [], 0 if key_changed else 0.1)
+            if ready:
+                data = read_pty(fd)
+                if data:
+                    output.append(data)
+                    output_text = b"".join(output).decode(errors="replace")
+                    rows, cols, rendered_lines = redraw("running")
+                    if (rows, cols) != last_size:
+                        resize_pty(fd, rows, cols)
+                        last_size = (rows, cols)
+
+            waited_pid, status = os.waitpid(pid, os.WNOHANG)
+            if waited_pid == pid:
+                data = read_pty(fd)
+                if data:
+                    output.append(data)
+                    output_text = b"".join(output).decode(errors="replace")
+                close_fd(fd)
+                returncode = os.waitstatus_to_exitcode(status)
+                redraw("done" if returncode == 0 else f"failed:{returncode}")
+                time.sleep(0.35)
+                return returncode, output_text
+    except KeyboardInterrupt:
+        try:
+            os.kill(pid, signal.SIGINT)
+            os.waitpid(pid, 0)
+        except (ChildProcessError, ProcessLookupError):
+            pass
+        close_fd(fd)
+        return 130, output_text
+
+
+def run_plan_tui(
+    plan_file: str,
+    step_name: str,
+    total_steps: int,
+    start_step: int,
+) -> tuple[int, str | None]:
+    return curses.wrapper(_run_plan_tui, plan_file, step_name, total_steps, start_step)
+
+
+def _run_plan_tui(
+    stdscr: curses.window,
+    plan_file: str,
+    step_name: str,
+    total_steps: int,
+    start_step: int,
+) -> tuple[int, str | None]:
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    init_colors()
+    stdscr.nodelay(True)
+
+    for step in range(start_step, total_steps + 1):
+        task = f"Implement {plan_file} {step_name} {step}"
+        returncode, _output = run_codex_exec_tui(
+            stdscr,
+            task,
+            step,
+            total_steps,
+        )
+        if returncode != 0:
+            return returncode, task
+
+    return 0, None
+
+
+def main() -> int:
+    require_command("fzf")
+    require_command("codex")
+
+    plan_file = choose_plan_file(list_markdown_files())
+    step_name = prompt("Step name", DEFAULT_STEP_NAME)
+    total_steps = prompt_int("How many total steps")
+    start_step = prompt_int("Where to start", 1)
+
+    if start_step > total_steps:
+        print("Start step cannot be greater than total steps.", file=sys.stderr)
+        return 1
+
+    if can_use_tui():
+        returncode, failed_task = run_plan_tui(
+            plan_file,
+            step_name,
+            total_steps,
+            start_step,
+        )
+    else:
+        returncode = 0
+        failed_task = None
+        for step in range(start_step, total_steps + 1):
+            task = f"Implement {plan_file} {step_name} {step}"
+            print(f"\n==> {task}\n")
+            returncode, _output = run_codex_exec(task)
+            if returncode != 0:
+                failed_task = task
+                break
+
+    if returncode != 0:
+        target = f" for {failed_task}" if failed_task else ""
+        print(
+            f"codex exec failed{target} with exit code {returncode}.",
+            file=sys.stderr,
+        )
+        return returncode
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
