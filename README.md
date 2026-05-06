@@ -1,52 +1,14 @@
-# codex-plan
+# agent-helpers
 
-- Minimal helper for running a plan broken up with phases through `codex exec`, one step at a time.
-- Rationale:
-  - break large work into focused plan phases
-  - minimize unnecessary or potentially misleading context
-  - drill into each phase separately so Codex can spend its attention on the right slice of the problem
-- Selects a `*.md` plan file from the current repo with `fzf`.
-- Prompts for:
-  - step name, defaulting to `phase`
-  - total step count
-  - starting step
-- Runs each step as:
+A small collection of tools and skills for working with coding agents.
 
-  ```sh
-  codex exec "Implement <plan-file> <step-name> <step-number>"
-  ```
+## Tools
 
-- Shows a split TUI when attached to a real terminal:
-  - left pane: prompt history for this run
-  - right pane: current Codex output
-  - line cursor and current step status
-  - completed steps include the last context/token summary found in Codex output
-- Supports Vim-style output navigation:
-  - `?`: show or hide the shortcuts tooltip
-  - `j` / down: move down
-  - `k` / up: move up
-  - `gg`: jump to top
-  - `G`: jump to bottom and follow new output
-  - `{` / `}`: jump between collapsed or expanded blocks
-  - space / enter: expand or collapse the current block
-- Collapses noisy tool output:
-  - tool-call blocks are shown as one-line summaries until expanded
-  - collapsed summaries include the block start timestamp and output line number
-  - diff hunks are shown as one-line summaries until expanded
-  - expanded diffs highlight added, deleted, and metadata lines
-  - long output is kept in a bounded line buffer with an omission marker when old lines are dropped
-- Falls back to plain sequential output when a TUI is not available.
-- Install with:
+- [`codex-plan`](./codex-plan/README.md) — run a phased markdown plan through `codex exec` one step at a time, with a split TUI for prompt history and current output.
 
-  ```sh
-  ./codex-plan/install.sh
-  ```
+## Skills
 
-- Installs a symlink to `~/.local/bin/codex-plan` by default.
-- Override the install directory with:
+Skills under [`.agents/skills/`](./.agents/skills/):
 
-  ```sh
-  CODEX_PLAN_INSTALL_DIR=/path/to/bin ./codex-plan/install.sh
-  ```
-
-- Requires `codex`, `fzf`, and Python 3.
+- [`architecture-survey`](./.agents/skills/architecture-survey/SKILL.md) — explore mode. Use when unsure what to build or whether simpler options exist. Maps the stack, names the problem, lays out 2–3 options neutrally.
+- [`boring-architecture`](./.agents/skills/boring-architecture/SKILL.md) — pushback mode. Use when there's a specific proposal to add infrastructure (queue, worker, microservice, cache, etc.) and you want it stress-tested. Picks one option without hedging.
