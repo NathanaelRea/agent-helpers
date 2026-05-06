@@ -17,10 +17,12 @@
   ```
 
 - Shows a split TUI when attached to a real terminal:
-  - left pane: current prompt
+  - left pane: prompt history for this run
   - right pane: current Codex output
   - line cursor and current step status
+  - completed steps include the last context/token summary found in Codex output
 - Supports Vim-style output navigation:
+  - `?`: show or hide the shortcuts tooltip
   - `j` / down: move down
   - `k` / up: move up
   - `gg`: jump to top
@@ -28,9 +30,11 @@
   - `{` / `}`: jump between collapsed or expanded blocks
   - space / enter: expand or collapse the current block
 - Collapses noisy tool output:
-  - `exec` blocks are shown as one-line summaries until expanded
+  - tool-call blocks are shown as one-line summaries until expanded
+  - collapsed summaries include the block start timestamp and output line number
   - diff hunks are shown as one-line summaries until expanded
   - expanded diffs highlight added, deleted, and metadata lines
+  - long output is kept in a bounded line buffer with an omission marker when old lines are dropped
 - Falls back to plain sequential output when a TUI is not available.
 - Install with:
 

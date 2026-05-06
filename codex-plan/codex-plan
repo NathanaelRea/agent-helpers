@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import curses
+import codecs
 import errno
 import fcntl
 import os
@@ -21,7 +22,9 @@ from pathlib import Path
 DEFAULT_STEP_NAME = "phase"
 ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 HUNK_RE = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
-OUTPUT_TAIL_CHARS = 20000
+OUTPUT_MAX_LINES = 2500
+OUTPUT_MIN_LINES = 1800
+TRIM_BOUNDARY_SEARCH_LINES = 300
 COLOR_ADD = 1
 COLOR_DELETE = 2
 COLOR_META = 3
@@ -46,6 +49,182 @@ class DisplayLine:
     text: str
     attr: int = 0
     block_id: str | None = None
+    source_line: int | None = None
+    timestamp: float | None = None
+
+
+@dataclass(frozen=True)
+class RawLine:
+    text: str
+    number: int
+    timestamp: float
+
+
+@dataclass
+class PromptRun:
+    prompt: str
+    step: int
+    total_steps: int
+    status: str = "queued"
+    context_summary: str | None = None
+
+
+@dataclass
+class OutputBuffer:
+    lines: list[RawLine] = field(default_factory=list)
+    partial: str = ""
+    partial_timestamp: float | None = None
+    next_line_number: int = 1
+    omitted_lines: int = 0
+    _decoder: codecs.IncrementalDecoder = field(
+        default_factory=lambda: codecs.getincrementaldecoder("utf-8")(
+            errors="replace"
+        )
+    )
+
+    @property
+    def first_line_number(self) -> int:
+        if self.lines:
+            return self.lines[0].number
+        return self.next_line_number
+
+    def append(self, data: bytes) -> None:
+        text = self._decoder.decode(data)
+        if not text:
+            return
+
+        self._append_text(text, time.time())
+
+    def _append_text(self, text: str, timestamp: float) -> None:
+        text = clean_for_display(text)
+        combined = self.partial + text
+        parts = combined.split("\n")
+        first_timestamp = self.partial_timestamp
+
+        if combined.endswith("\n"):
+            complete = parts[:-1]
+            next_partial = ""
+            next_partial_timestamp = None
+        else:
+            complete = parts[:-1]
+            next_partial = parts[-1]
+            if self.partial:
+                next_partial_timestamp = self.partial_timestamp
+            elif next_partial:
+                next_partial_timestamp = timestamp
+            else:
+                next_partial_timestamp = None
+
+        for index, line in enumerate(complete):
+            line_timestamp = (
+                first_timestamp
+                if index == 0 and first_timestamp is not None
+                else timestamp
+            )
+            self.lines.append(RawLine(line, self.next_line_number, line_timestamp))
+            self.next_line_number += 1
+
+        self.partial = next_partial
+        self.partial_timestamp = next_partial_timestamp
+
+        self.trim()
+
+    def finish(self) -> None:
+        remaining = self._decoder.decode(b"", final=True)
+        if remaining:
+            self._append_text(remaining, time.time())
+        if self.partial:
+            timestamp = self.partial_timestamp or time.time()
+            self.lines.append(RawLine(self.partial, self.next_line_number, timestamp))
+            self.next_line_number += 1
+            self.partial = ""
+            self.partial_timestamp = None
+            self.trim()
+
+    def trim(self) -> None:
+        if len(self.lines) <= OUTPUT_MAX_LINES:
+            return
+
+        trim_count = len(self.lines) - OUTPUT_MIN_LINES
+        boundary = self._trim_boundary(trim_count)
+        continuation = self._event_continuation(boundary)
+        dropped = self.lines[:boundary]
+        self.lines = self.lines[boundary:]
+        if continuation:
+            self.lines = continuation + self.lines
+        self.omitted_lines += len(dropped)
+
+    def _trim_boundary(self, preferred: int) -> int:
+        texts = [line.text for line in self.lines]
+        lower = max(1, preferred - TRIM_BOUNDARY_SEARCH_LINES)
+        upper = min(len(texts) - 1, preferred + TRIM_BOUNDARY_SEARCH_LINES)
+
+        for index in range(preferred, upper + 1):
+            if is_block_start(texts, index):
+                return index
+
+        for index in range(preferred, lower - 1, -1):
+            if is_block_start(texts, index):
+                return index
+
+        return preferred
+
+    def _event_continuation(self, boundary: int) -> list[RawLine]:
+        if boundary <= 0 or boundary >= len(self.lines):
+            return []
+
+        texts = [line.text for line in self.lines]
+        start = None
+        for index in range(boundary - 1, -1, -1):
+            if is_event_start(texts, index):
+                start = index
+                break
+
+        if start is None:
+            return []
+
+        for index in range(start + 2, len(texts)):
+            if texts[index].strip() in EVENT_MARKERS or is_diff_start(texts, index):
+                if index <= boundary:
+                    return []
+                break
+
+        marker = self.lines[start]
+        detail = None
+        for index in range(start + 1, boundary):
+            text = self.lines[index].text.strip()
+            if (
+                text
+                and text not in {"command", "output"}
+                and not text.startswith(("command:", "output:"))
+            ):
+                detail = self.lines[index]
+                break
+
+        if detail is None:
+            detail = RawLine("continued tool call", marker.number, marker.timestamp)
+
+        resumes_at = self.lines[boundary].number
+        omitted = boundary - start
+        return [
+            marker,
+            detail,
+            RawLine(
+                f"... {omitted} earlier lines from this tool call omitted; resumes at L{resumes_at}",
+                resumes_at,
+                self.lines[boundary].timestamp,
+            ),
+        ]
+
+    def display_lines(self) -> list[RawLine]:
+        lines = list(self.lines)
+        if self.partial:
+            timestamp = self.partial_timestamp or time.time()
+            lines.append(RawLine(self.partial, self.next_line_number, timestamp))
+        return lines
+
+    def text(self) -> str:
+        return "\n".join(line.text for line in self.display_lines())
 
 
 @dataclass
@@ -56,9 +235,12 @@ class TuiState:
     follow: bool = True
     pending_g: bool = False
     output_cache_tail: str = ""
+    output_cache_first_line_number: int = 0
+    output_cache_omitted_lines: int = 0
     output_cache_width: int = -1
     output_cache_expanded_blocks: frozenset[str] = field(default_factory=frozenset)
     output_cache_lines: list[DisplayLine] = field(default_factory=list)
+    show_help: bool = False
 
 
 def require_command(name: str) -> None:
@@ -198,20 +380,9 @@ def wrap_display_line(line: DisplayLine, width: int) -> list[DisplayLine]:
         drop_whitespace=False,
     ) or [""]
     return [
-        DisplayLine(text, line.attr, line.block_id)
+        DisplayLine(text, line.attr, line.block_id, line.source_line, line.timestamp)
         for text in wrapped
     ]
-
-
-def wrapped_lines(text: str, width: int, max_lines: int) -> list[DisplayLine]:
-    if width < 1 or max_lines < 1:
-        return []
-
-    lines: list[DisplayLine] = []
-    for line in clean_for_display(text[-OUTPUT_TAIL_CHARS:]).splitlines() or [""]:
-        lines.extend(wrap_display_line(DisplayLine(line), width))
-
-    return lines[-max_lines:]
 
 
 def is_diff_fragment_start(lines: list[str], index: int) -> bool:
@@ -226,8 +397,12 @@ def is_diff_start(lines: list[str], index: int) -> bool:
     return lines[index].startswith("diff --git ") or is_diff_fragment_start(lines, index)
 
 
-def is_exec_start(lines: list[str], index: int) -> bool:
-    return lines[index].strip() == "exec" and index + 1 < len(lines)
+def is_event_start(lines: list[str], index: int) -> bool:
+    return lines[index].strip() in EVENT_MARKERS and index + 1 < len(lines)
+
+
+def is_block_start(lines: list[str], index: int) -> bool:
+    return is_event_start(lines, index) or is_diff_start(lines, index)
 
 
 def is_diff_metadata(line: str) -> bool:
@@ -253,7 +428,7 @@ def is_diff_metadata(line: str) -> bool:
 
 
 def parse_diff_block(
-    raw_lines: list[str],
+    raw_lines: list[RawLine],
     start: int,
     block_id: str,
 ) -> tuple[int, list[DisplayLine]]:
@@ -264,7 +439,8 @@ def parse_diff_block(
     saw_hunk = False
 
     while index < len(raw_lines):
-        line = raw_lines[index]
+        raw_line = raw_lines[index]
+        line = raw_line.text
         if index > start and line.startswith("diff --git "):
             break
 
@@ -309,29 +485,49 @@ def parse_diff_block(
         if not is_part:
             break
 
-        lines.append(DisplayLine(line, attr, block_id))
+        lines.append(
+            DisplayLine(line, attr, block_id, raw_line.number, raw_line.timestamp)
+        )
         index += 1
 
     if not lines:
-        return start + 1, [DisplayLine(raw_lines[start], block_id=block_id)]
+        raw_line = raw_lines[start]
+        return start + 1, [
+            DisplayLine(
+                raw_line.text,
+                block_id=block_id,
+                source_line=raw_line.number,
+                timestamp=raw_line.timestamp,
+            )
+        ]
 
     return index, lines
 
 
-def parse_exec_block(
-    raw_lines: list[str],
+def parse_event_block(
+    raw_lines: list[RawLine],
+    raw_texts: list[str],
     start: int,
     block_id: str,
 ) -> tuple[int, list[DisplayLine]]:
+    first = raw_lines[start]
     lines: list[DisplayLine] = [
-        DisplayLine(raw_lines[start], ATTR_META or curses.A_BOLD, block_id)
+        DisplayLine(
+            first.text,
+            ATTR_META or curses.A_BOLD,
+            block_id,
+            first.number,
+            first.timestamp,
+        )
     ]
     index = start + 1
 
     while index < len(raw_lines):
-        stripped = raw_lines[index].strip()
+        raw_line = raw_lines[index]
+        stripped = raw_line.text.strip()
         if index > start + 1 and (
-            stripped in EVENT_MARKERS or is_diff_start(raw_lines, index)
+            stripped in EVENT_MARKERS
+            or is_diff_start(raw_texts, index)
         ):
             break
 
@@ -341,10 +537,30 @@ def parse_exec_block(
             or stripped.startswith(("command:", "output:"))
             else 0
         )
-        lines.append(DisplayLine(raw_lines[index], attr, block_id))
+        lines.append(
+            DisplayLine(
+                raw_line.text,
+                attr,
+                block_id,
+                raw_line.number,
+                raw_line.timestamp,
+            )
+        )
         index += 1
 
     return index, lines
+
+
+def format_timestamp(timestamp: float | None) -> str:
+    if timestamp is None:
+        return "--:--:--"
+    return time.strftime("%H:%M:%S", time.localtime(timestamp))
+
+
+def block_prefix(lines: list[DisplayLine]) -> str:
+    first = lines[0] if lines else DisplayLine("")
+    line = f"L{first.source_line}" if first.source_line is not None else "L?"
+    return f"{format_timestamp(first.timestamp)} {line}"
 
 
 def collapsed_diff_summary(lines: list[DisplayLine]) -> str:
@@ -353,11 +569,12 @@ def collapsed_diff_summary(lines: list[DisplayLine]) -> str:
         parts = title.split()
         if len(parts) >= 4:
             title = f"{parts[2]} -> {parts[3]}"
-    return f"[+] {title} ({len(lines)} lines collapsed)"
+    return f"[+] {block_prefix(lines)} diff: {title} ({len(lines)} lines collapsed)"
 
 
-def collapsed_exec_summary(lines: list[DisplayLine]) -> str:
-    command = "exec"
+def collapsed_event_summary(lines: list[DisplayLine]) -> str:
+    marker = lines[0].text.strip() if lines else "tool"
+    detail = marker
     for line in lines[1:]:
         text = line.text.strip()
         if (
@@ -365,37 +582,69 @@ def collapsed_exec_summary(lines: list[DisplayLine]) -> str:
             and text not in {"command", "output"}
             and not text.startswith(("command:", "output:"))
         ):
-            command = text
+            detail = text
             break
-    return f"[+] exec: {command} ({len(lines)} lines collapsed)"
+    return f"[+] {block_prefix(lines)} {marker}: {detail} ({len(lines)} lines collapsed)"
 
 
-def build_output_lines(text: str, width: int, state: TuiState) -> list[DisplayLine]:
+def build_output_lines(
+    raw_lines: list[RawLine],
+    omitted_lines: int,
+    width: int,
+    state: TuiState,
+) -> list[DisplayLine]:
     if width < 1:
         return []
 
-    raw_lines = clean_for_display(text[-OUTPUT_TAIL_CHARS:]).splitlines()
+    raw_texts = [line.text for line in raw_lines]
     output_lines: list[DisplayLine] = []
     index = 0
     diff_index = 0
-    exec_index = 0
+
+    if omitted_lines and raw_lines:
+        resume_number = next(
+            (
+                line.number
+                for line in raw_lines
+                if line.number > omitted_lines
+            ),
+            raw_lines[0].number,
+        )
+        marker = DisplayLine(
+            f"... {omitted_lines} earlier output lines omitted; retained output resumes at L{resume_number}",
+            ATTR_META,
+        )
+        output_lines.extend(wrap_display_line(marker, width))
 
     while index < len(raw_lines):
-        if is_exec_start(raw_lines, index):
-            block_id = f"exec:{exec_index}:{raw_lines[index + 1]}"
-            next_index, exec_lines = parse_exec_block(raw_lines, index, block_id)
+        if is_event_start(raw_texts, index):
+            block_id = f"event:{raw_lines[index].number}"
+            next_index, event_lines = parse_event_block(
+                raw_lines,
+                raw_texts,
+                index,
+                block_id,
+            )
             if block_id in state.expanded_blocks:
-                first = exec_lines[0]
+                first = event_lines[0]
                 visible_lines = [
-                    DisplayLine(f"[-] {first.text}", first.attr or ATTR_META, block_id),
-                    *exec_lines[1:],
+                    DisplayLine(
+                        f"[-] {block_prefix(event_lines)} {first.text}",
+                        first.attr or ATTR_META,
+                        block_id,
+                        first.source_line,
+                        first.timestamp,
+                    ),
+                    *event_lines[1:],
                 ]
             else:
                 visible_lines = [
                     DisplayLine(
-                        collapsed_exec_summary(exec_lines),
+                        collapsed_event_summary(event_lines),
                         ATTR_META or curses.A_BOLD,
                         block_id,
+                        event_lines[0].source_line if event_lines else None,
+                        event_lines[0].timestamp if event_lines else None,
                     )
                 ]
 
@@ -403,18 +652,19 @@ def build_output_lines(text: str, width: int, state: TuiState) -> list[DisplayLi
                 output_lines.extend(wrap_display_line(line, width))
 
             index = max(next_index, index + 1)
-            exec_index += 1
             continue
 
-        if is_diff_start(raw_lines, index):
-            block_id = f"diff:{diff_index}:{raw_lines[index]}"
+        if is_diff_start(raw_texts, index):
+            block_id = f"diff:{raw_lines[index].number}:{diff_index}"
             next_index, diff_lines = parse_diff_block(raw_lines, index, block_id)
             if block_id in state.expanded_blocks:
                 first = diff_lines[0]
                 expanded_first = DisplayLine(
-                    f"[-] {first.text}",
+                    f"[-] {block_prefix(diff_lines)} {first.text}",
                     first.attr or ATTR_META,
                     block_id,
+                    first.source_line,
+                    first.timestamp,
                 )
                 visible_lines = [expanded_first, *diff_lines[1:]]
             else:
@@ -423,6 +673,8 @@ def build_output_lines(text: str, width: int, state: TuiState) -> list[DisplayLi
                         collapsed_diff_summary(diff_lines),
                         ATTR_META or curses.A_BOLD,
                         block_id,
+                        diff_lines[0].source_line if diff_lines else None,
+                        diff_lines[0].timestamp if diff_lines else None,
                     )
                 ]
 
@@ -433,24 +685,45 @@ def build_output_lines(text: str, width: int, state: TuiState) -> list[DisplayLi
             diff_index += 1
             continue
 
-        output_lines.extend(wrap_display_line(DisplayLine(raw_lines[index]), width))
+        raw_line = raw_lines[index]
+        output_lines.extend(
+            wrap_display_line(
+                DisplayLine(
+                    raw_line.text,
+                    source_line=raw_line.number,
+                    timestamp=raw_line.timestamp,
+                ),
+                width,
+            )
+        )
         index += 1
 
     return output_lines
 
 
-def cached_output_lines(text: str, width: int, state: TuiState) -> list[DisplayLine]:
-    tail = text[-OUTPUT_TAIL_CHARS:]
+def cached_output_lines(
+    output: OutputBuffer,
+    width: int,
+    state: TuiState,
+) -> list[DisplayLine]:
+    raw_lines = output.display_lines()
+    cache_text = "\n".join(
+        f"{line.number}:{line.timestamp}:{line.text}" for line in raw_lines
+    )
     expanded_blocks = frozenset(state.expanded_blocks)
     if (
-        tail == state.output_cache_tail
+        cache_text == state.output_cache_tail
+        and output.first_line_number == state.output_cache_first_line_number
+        and output.omitted_lines == state.output_cache_omitted_lines
         and width == state.output_cache_width
         and expanded_blocks == state.output_cache_expanded_blocks
     ):
         return state.output_cache_lines
 
-    output_lines = build_output_lines(tail, width, state)
-    state.output_cache_tail = tail
+    output_lines = build_output_lines(raw_lines, output.omitted_lines, width, state)
+    state.output_cache_tail = cache_text
+    state.output_cache_first_line_number = output.first_line_number
+    state.output_cache_omitted_lines = output.omitted_lines
     state.output_cache_width = width
     state.output_cache_expanded_blocks = expanded_blocks
     state.output_cache_lines = output_lines
@@ -501,6 +774,10 @@ def move_to_bottom(state: TuiState, line_count: int) -> None:
 
     state.cursor = line_count - 1
     state.follow = True
+
+
+def toggle_help(state: TuiState) -> None:
+    state.show_help = not state.show_help
 
 
 def block_start_indexes(lines: list[DisplayLine]) -> list[int]:
@@ -593,6 +870,9 @@ def handle_keys(
         elif key in (ord(" "), ord("\n"), ord("\r"), curses.KEY_ENTER):
             toggle_current_block(state, lines)
             changed = True
+        elif key == ord("?"):
+            toggle_help(state)
+            changed = True
         elif key == curses.KEY_RESIZE:
             changed = True
 
@@ -632,6 +912,63 @@ def draw_pane(
         addstr(pane, index + 1, 2, line.text[:body_width], line.attr)
 
 
+def draw_help_overlay(stdscr: curses.window) -> None:
+    help_lines = [
+        "?        show/hide shortcuts",
+        "j/down   move down",
+        "k/up     move up",
+        "gg       jump to top",
+        "G        jump to bottom and follow",
+        "{ / }    previous/next tool or diff",
+        "space    expand/collapse selected block",
+    ]
+    height, width = stdscr.getmaxyx()
+    box_width = min(max(len(line) for line in help_lines) + 6, width - 4)
+    box_height = min(len(help_lines) + 4, height - 2)
+    if box_width < 24 or box_height < 6:
+        return
+
+    y = max(0, (height - box_height) // 2)
+    x = max(0, (width - box_width) // 2)
+    window = stdscr.derwin(box_height, box_width, y, x)
+    window.erase()
+    window.box()
+    addstr(window, 0, 2, " Shortcuts ", curses.A_BOLD)
+    for index, line in enumerate(help_lines[: box_height - 3]):
+        addstr(window, index + 2, 3, line)
+
+
+def prompt_history_lines(
+    runs: list[PromptRun],
+    width: int,
+    max_lines: int,
+) -> list[DisplayLine]:
+    if width < 1 or max_lines < 1:
+        return []
+
+    lines: list[DisplayLine] = []
+    for run in runs:
+        summary = f"{run.step}/{run.total_steps} {run.status}"
+        if run.context_summary:
+            summary = f"{summary}  {run.context_summary}"
+        lines.extend(
+            wrap_display_line(DisplayLine(summary, ATTR_META or curses.A_BOLD), width)
+        )
+        prompt_lines = textwrap.wrap(
+            run.prompt,
+            width=max(1, width - 2),
+            replace_whitespace=False,
+            drop_whitespace=False,
+        ) or [""]
+        for prompt_line in prompt_lines:
+            lines.append(DisplayLine(f"  {prompt_line}"))
+        lines.append(DisplayLine(""))
+
+    if lines and not lines[-1].text:
+        lines.pop()
+    return lines[-max_lines:]
+
+
 def layout_dimensions(stdscr: curses.window) -> tuple[int, int, int, int]:
     height, width = stdscr.getmaxyx()
     left_width = max(22, min(44, width // 3))
@@ -645,7 +982,8 @@ def layout_dimensions(stdscr: curses.window) -> tuple[int, int, int, int]:
 def render_tui(
     stdscr: curses.window,
     current_prompt: str,
-    output: str,
+    output: OutputBuffer,
+    runs: list[PromptRun],
     step: int,
     total_steps: int,
     status: str,
@@ -662,8 +1000,8 @@ def render_tui(
     _, left_width, right_x, right_width = layout_dimensions(stdscr)
     title_attr = curses.A_BOLD
 
-    prompt_lines = wrapped_lines(
-        current_prompt,
+    prompt_lines = prompt_history_lines(
+        runs,
         left_width - 4,
         height - 2,
     )
@@ -699,7 +1037,7 @@ def render_tui(
         0,
         height,
         left_width,
-        "Prompt",
+        "Prompts",
         prompt_lines,
         title_attr,
     )
@@ -713,6 +1051,8 @@ def render_tui(
         output_header + visible_output,
         title_attr,
     )
+    if state.show_help:
+        draw_help_overlay(stdscr)
     stdscr.refresh()
 
     return output_view_height, max(20, right_width - 4), output_lines
@@ -766,21 +1106,40 @@ def close_fd(fd: int) -> None:
         pass
 
 
+def extract_context_summary(output_text: str) -> str | None:
+    lines = clean_for_display(output_text).splitlines()
+    for line in reversed(lines[-80:]):
+        text = " ".join(line.strip().split())
+        if not text:
+            continue
+        lower = text.lower()
+        if "context" not in lower and "token" not in lower:
+            continue
+        text = text.strip("│┃▌▍▎▏| ")
+        if len(text) > 42:
+            text = f"{text[:39]}..."
+        return text
+    return None
+
+
 def run_codex_exec_tui(
     stdscr: curses.window,
     task: str,
     step: int,
     total_steps: int,
+    runs: list[PromptRun],
+    current_run: PromptRun,
 ) -> tuple[int, str]:
-    output: list[bytes] = []
-    output_text = ""
+    output = OutputBuffer()
     state = TuiState()
 
     def redraw(status: str) -> tuple[int, int, list[DisplayLine]]:
+        current_run.status = status
         return render_tui(
             stdscr,
             task,
-            output_text,
+            output,
+            runs,
             step,
             total_steps,
             status,
@@ -815,7 +1174,6 @@ def run_codex_exec_tui(
                 data = read_pty(fd)
                 if data:
                     output.append(data)
-                    output_text = b"".join(output).decode(errors="replace")
                     rows, cols, rendered_lines = redraw("running")
                     if (rows, cols) != last_size:
                         resize_pty(fd, rows, cols)
@@ -826,9 +1184,11 @@ def run_codex_exec_tui(
                 data = read_pty(fd)
                 if data:
                     output.append(data)
-                    output_text = b"".join(output).decode(errors="replace")
+                output.finish()
                 close_fd(fd)
                 returncode = os.waitstatus_to_exitcode(status)
+                output_text = output.text()
+                current_run.context_summary = extract_context_summary(output_text)
                 redraw("done" if returncode == 0 else f"failed:{returncode}")
                 time.sleep(0.35)
                 return returncode, output_text
@@ -839,6 +1199,10 @@ def run_codex_exec_tui(
         except (ChildProcessError, ProcessLookupError):
             pass
         close_fd(fd)
+        output.finish()
+        output_text = output.text()
+        current_run.context_summary = extract_context_summary(output_text)
+        current_run.status = "interrupted"
         return 130, output_text
 
 
@@ -864,14 +1228,19 @@ def _run_plan_tui(
         pass
     init_colors()
     stdscr.nodelay(True)
+    runs: list[PromptRun] = []
 
     for step in range(start_step, total_steps + 1):
         task = f"Implement {plan_file} {step_name} {step}"
+        current_run = PromptRun(task, step, total_steps, "running")
+        runs.append(current_run)
         returncode, _output = run_codex_exec_tui(
             stdscr,
             task,
             step,
             total_steps,
+            runs,
+            current_run,
         )
         if returncode != 0:
             return returncode, task
