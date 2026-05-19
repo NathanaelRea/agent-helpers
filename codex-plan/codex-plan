@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import curses
 import codecs
 import errno
@@ -41,6 +43,12 @@ EVENT_MARKERS = {
     "spawn_agent",
     "wait_agent",
     "read_mcp_resource",
+}
+CODEX_CHILD_ENV_DROP = {
+    "CODEX_CI",
+    "CODEX_SANDBOX",
+    "CODEX_SANDBOX_NETWORK_DISABLED",
+    "CODEX_THREAD_ID",
 }
 
 
@@ -306,6 +314,13 @@ def choose_plan_file(files: list[str]) -> str:
     return selected
 
 
+def codex_child_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for name in CODEX_CHILD_ENV_DROP:
+        env.pop(name, None)
+    return env
+
+
 def run_codex_exec(task: str) -> tuple[int, str]:
     output: list[bytes] = []
 
@@ -314,7 +329,15 @@ def run_codex_exec(task: str) -> tuple[int, str]:
         output.append(data)
         return data
 
-    status = pty.spawn(["codex", "exec", task], master_read=read_and_capture)
+    original_env = os.environ.copy()
+    child_env = codex_child_env()
+    try:
+        os.environ.clear()
+        os.environ.update(child_env)
+        status = pty.spawn(["codex", "exec", task], master_read=read_and_capture)
+    finally:
+        os.environ.clear()
+        os.environ.update(original_env)
     return os.waitstatus_to_exitcode(status), b"".join(output).decode(
         errors="replace"
     )
@@ -1069,7 +1092,7 @@ def spawn_codex_exec(task: str, rows: int, cols: int) -> tuple[int, int]:
     pid, fd = pty.fork()
     if pid == 0:
         try:
-            os.execvp("codex", ["codex", "exec", task])
+            os.execvpe("codex", ["codex", "exec", task], codex_child_env())
         except OSError as error:
             print(f"Failed to start codex: {error}", file=sys.stderr)
             os._exit(127)
@@ -1211,7 +1234,7 @@ def run_plan_tui(
     step_name: str,
     total_steps: int,
     start_step: int,
-) -> tuple[int, str | None]:
+) -> tuple[int, str | None, str]:
     return curses.wrapper(_run_plan_tui, plan_file, step_name, total_steps, start_step)
 
 
@@ -1221,7 +1244,7 @@ def _run_plan_tui(
     step_name: str,
     total_steps: int,
     start_step: int,
-) -> tuple[int, str | None]:
+) -> tuple[int, str | None, str]:
     try:
         curses.curs_set(0)
     except curses.error:
@@ -1234,7 +1257,7 @@ def _run_plan_tui(
         task = f"Implement {plan_file} {step_name} {step}"
         current_run = PromptRun(task, step, total_steps, "running")
         runs.append(current_run)
-        returncode, _output = run_codex_exec_tui(
+        returncode, output = run_codex_exec_tui(
             stdscr,
             task,
             step,
@@ -1243,9 +1266,20 @@ def _run_plan_tui(
             current_run,
         )
         if returncode != 0:
-            return returncode, task
+            return returncode, task, output
 
-    return 0, None
+    return 0, None, ""
+
+
+def print_failure_output(output: str, max_lines: int = 80) -> None:
+    lines = clean_for_display(output).splitlines()
+    lines = [line for line in lines if line.strip()]
+    if not lines:
+        return
+
+    print("\n--- codex exec output ---", file=sys.stderr)
+    for line in lines[-max_lines:]:
+        print(line, file=sys.stderr)
 
 
 def main() -> int:
@@ -1262,7 +1296,7 @@ def main() -> int:
         return 1
 
     if can_use_tui():
-        returncode, failed_task = run_plan_tui(
+        returncode, failed_task, failed_output = run_plan_tui(
             plan_file,
             step_name,
             total_steps,
@@ -1271,15 +1305,18 @@ def main() -> int:
     else:
         returncode = 0
         failed_task = None
+        failed_output = ""
         for step in range(start_step, total_steps + 1):
             task = f"Implement {plan_file} {step_name} {step}"
             print(f"\n==> {task}\n")
-            returncode, _output = run_codex_exec(task)
+            returncode, output = run_codex_exec(task)
             if returncode != 0:
                 failed_task = task
+                failed_output = output
                 break
 
     if returncode != 0:
+        print_failure_output(failed_output)
         target = f" for {failed_task}" if failed_task else ""
         print(
             f"codex exec failed{target} with exit code {returncode}.",
