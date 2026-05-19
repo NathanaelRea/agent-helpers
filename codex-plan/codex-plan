@@ -50,6 +50,8 @@ CODEX_CHILD_ENV_DROP = {
     "CODEX_SANDBOX_NETWORK_DISABLED",
     "CODEX_THREAD_ID",
 }
+AZURE_OPENAI_API_KEY_ENV = "AZURE_OPENAI_API_KEY"
+CODEX_KEYCHAIN_SERVICE = "codex"
 
 
 @dataclass(frozen=True)
@@ -318,7 +320,28 @@ def codex_child_env() -> dict[str, str]:
     env = os.environ.copy()
     for name in CODEX_CHILD_ENV_DROP:
         env.pop(name, None)
+    if not env.get(AZURE_OPENAI_API_KEY_ENV):
+        key = read_codex_keychain_secret()
+        if key:
+            env[AZURE_OPENAI_API_KEY_ENV] = key
     return env
+
+
+def read_codex_keychain_secret() -> str | None:
+    if shutil.which("security") is None:
+        return None
+
+    result = subprocess.run(
+        ["security", "find-generic-password", "-s", CODEX_KEYCHAIN_SERVICE, "-w"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+
+    return result.stdout.strip() or None
 
 
 def run_codex_exec(task: str) -> tuple[int, str]:
