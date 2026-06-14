@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -66,6 +67,37 @@ pub fn ensure_agent_session(
         generation,
         CREATED_SESSION_READY_WAIT,
     ))
+}
+
+pub fn paste_agent_prompt(
+    repo: &Repository,
+    config: &Config,
+    session: &Session,
+    generation: u64,
+    prompt: &str,
+) -> Result<(), String> {
+    let name = agent_session_name(repo, &session.branch, generation);
+    if !ensure_agent_session(repo, config, session, generation)? {
+        return Err("agent session did not become ready".to_string());
+    }
+    let buffer_name = format!("{name}-prompt");
+    run_tmux_status_with_stdin(
+        Command::new(config.tool("tmux")).env_remove("TMUX").args([
+            "load-buffer",
+            "-b",
+            &buffer_name,
+            "-",
+        ]),
+        prompt,
+    )?;
+    run_tmux_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
+        "paste-buffer",
+        "-d",
+        "-b",
+        &buffer_name,
+        "-t",
+        &name,
+    ]))
 }
 
 pub fn agent_session_running(
@@ -217,6 +249,31 @@ fn run_tmux_status(command: &mut Command) -> Result<(), String> {
     }
 }
 
+fn run_tmux_status_with_stdin(command: &mut Command, stdin: &str) -> Result<(), String> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("tmux: {error}"))?;
+    if let Some(mut child_stdin) = child.stdin.take() {
+        child_stdin
+            .write_all(stdin.as_bytes())
+            .map_err(|error| format!("tmux: {error}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("tmux: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        Err(format!("tmux exited with {}", output.status))
+    } else {
+        Err(stderr)
+    }
+}
+
 fn tmux_missing_session_error(error: &str) -> bool {
     error.contains("can't find session")
         || error.contains("can't find window")
@@ -257,7 +314,7 @@ fn pane_current_command(config: &Config, name: &str) -> Option<String> {
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
             .args(["display-message", "-p", "-t"])
-            .arg(format!("{name}:0.0"))
+            .arg(name)
             .arg("#{pane_current_command}"),
     )
     .ok()
@@ -318,7 +375,8 @@ mod tests {
 
     use super::{
         agent_session_name, attach_or_create_agent, ensure_agent_session,
-        latest_agent_session_generation, pane_command_matches_agent, shell_quote,
+        latest_agent_session_generation, pane_command_matches_agent, paste_agent_prompt,
+        shell_quote,
     };
 
     #[test]
@@ -419,6 +477,7 @@ exit 1
         let mut permissions = fs::metadata(&tmux).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&tmux, permissions).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
 
         let mut config = test_config();
         config
@@ -428,6 +487,134 @@ exit 1
         let generation = latest_agent_session_generation(&repo, &config, "feature");
 
         assert_eq!(generation, Some(7));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn paste_agent_prompt_loads_and_pastes_tmux_buffer() {
+        let temp = unique_temp_dir("prism-tmux-paste-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("tmux.log");
+        let prompt_file = temp.join("prompt.txt");
+        let tmux = temp.join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1" in
+  has-session|set-option)
+    exit 0
+    ;;
+  display-message)
+    echo opencode
+    exit 0
+    ;;
+  load-buffer)
+    cat > '{}'
+    exit 0
+    ;;
+  paste-buffer)
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+                log.display(),
+                prompt_file.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        config
+            .tools
+            .insert("opencode".to_string(), "opencode".to_string());
+        let repo = Repository { root: temp.clone() };
+        let session = test_session(temp.join("worktree"), "feature");
+
+        paste_agent_prompt(&repo, &config, &session, 0, "hello\nworld").unwrap();
+
+        assert_eq!(fs::read_to_string(&prompt_file).unwrap(), "hello\nworld");
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(commands.contains("load-buffer -b"));
+        assert!(commands.contains("paste-buffer -d -b"));
+        assert!(!commands.contains("attach-session"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn paste_agent_prompt_does_not_require_window_zero() {
+        let temp = unique_temp_dir("prism-tmux-base-index-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("tmux.log");
+        let prompt_file = temp.join("prompt.txt");
+        let tmux = temp.join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+for arg in "$@"; do
+  case "$arg" in
+    *:0.0*)
+      echo "can't find window 0" >&2
+      exit 1
+      ;;
+  esac
+done
+case "$1" in
+  has-session|set-option)
+    exit 0
+    ;;
+  display-message)
+    echo opencode
+    exit 0
+    ;;
+  load-buffer)
+    cat > '{}'
+    exit 0
+    ;;
+  paste-buffer)
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+                log.display(),
+                prompt_file.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        config
+            .tools
+            .insert("opencode".to_string(), "opencode".to_string());
+        let repo = Repository { root: temp.clone() };
+        let session = test_session(temp.join("worktree"), "feature");
+
+        paste_agent_prompt(&repo, &config, &session, 0, "hello").unwrap();
+
+        assert_eq!(fs::read_to_string(&prompt_file).unwrap(), "hello");
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(!commands.contains(":0.0"));
 
         let _ = fs::remove_dir_all(temp);
     }

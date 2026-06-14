@@ -5,6 +5,108 @@ use crate::config::Config;
 use crate::session::Session;
 use crate::util::{empty_dash, indent_markdown_block};
 
+pub fn build_review_fix_prompt(session: &Session) -> Result<String, String> {
+    let summary = session
+        .pr
+        .summary
+        .as_ref()
+        .ok_or_else(|| "no pull request found for selected branch".to_string())?;
+    let details = session.pr.details.clone().unwrap_or_default();
+
+    let mut comments = details.comments;
+    comments.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.author.cmp(&b.author))
+            .then_with(|| a.body.cmp(&b.body))
+    });
+    let mut reviews = details.reviews;
+    reviews.sort_by(|a, b| {
+        a.submitted_at
+            .cmp(&b.submitted_at)
+            .then_with(|| a.author.cmp(&b.author))
+            .then_with(|| a.state.cmp(&b.state))
+            .then_with(|| a.body.cmp(&b.body))
+    });
+    let mut review_comments = details.review_comments;
+    review_comments.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.created_at.cmp(&b.created_at))
+            .then_with(|| a.author.cmp(&b.author))
+            .then_with(|| a.body.cmp(&b.body))
+    });
+
+    let mut prompt = format!(
+        "Here are some comments on PR {}. If they are applicable, fix them. Otherwise, say why not.\n\n",
+        summary.number
+    );
+    prompt.push_str("## PR Comments\n\n");
+
+    let mut wrote_comment = false;
+    for comment in &comments {
+        if comment.body.trim().is_empty() {
+            continue;
+        }
+        wrote_comment = true;
+        prompt.push_str(&format!(
+            "### Conversation comment from {} {}\n\n{}\n\n",
+            empty_dash(&comment.author),
+            empty_dash(&comment.created_at),
+            comment.body.trim()
+        ));
+    }
+
+    for review in &reviews {
+        if review.body.trim().is_empty() {
+            continue;
+        }
+        wrote_comment = true;
+        prompt.push_str(&format!(
+            "### Review {} from {} {}\n\n{}\n\n",
+            empty_dash(&review.state),
+            empty_dash(&review.author),
+            empty_dash(&review.submitted_at),
+            review.body.trim()
+        ));
+    }
+
+    let mut current_file = String::new();
+    for comment in &review_comments {
+        if comment.body.trim().is_empty() {
+            continue;
+        }
+        wrote_comment = true;
+        if comment.path != current_file {
+            current_file = comment.path.clone();
+            prompt.push_str(&format!(
+                "### Inline comments on {}\n\n",
+                empty_dash(&current_file)
+            ));
+        }
+        let line = if comment.line.is_empty() {
+            "-".to_string()
+        } else {
+            format!("line {}", comment.line)
+        };
+        prompt.push_str(&format!(
+            "- {} from {} {}:\n\n{}\n\n",
+            line,
+            empty_dash(&comment.author),
+            empty_dash(&comment.created_at),
+            indent_markdown_block(comment.body.trim())
+        ));
+    }
+
+    if !wrote_comment {
+        prompt.push_str("No PR comments were found.\n\n");
+    }
+    prompt.push_str("Make the requested changes, run relevant checks, and summarize what changed.");
+
+    Ok(prompt)
+}
+
 pub fn write_review_packet(session: &Session, config: &Config) -> Result<PathBuf, String> {
     let summary = session
         .pr
@@ -153,4 +255,90 @@ pub fn write_review_packet(session: &Session, config: &Config) -> Result<PathBuf
 
     fs::write(&path, text).map_err(|error| format!("write review packet: {error}"))?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
+
+    use crate::agent::AgentState;
+    use crate::github::{PrCache, PrComment, PrDetails, PrReview, PrReviewComment, PrSummary};
+
+    use super::*;
+
+    #[test]
+    fn review_fix_prompt_contains_comments_without_review_packet_sections() {
+        let session = test_session(PrDetails {
+            comments: vec![PrComment {
+                author: "alice".to_string(),
+                body: "Please simplify this branch.".to_string(),
+                created_at: "2026-06-14T10:00:00Z".to_string(),
+            }],
+            reviews: vec![PrReview {
+                author: "bob".to_string(),
+                state: "CHANGES_REQUESTED".to_string(),
+                body: "This should mention the fallback behavior.".to_string(),
+                submitted_at: "2026-06-14T11:00:00Z".to_string(),
+            }],
+            review_comments: vec![PrReviewComment {
+                author: "carol".to_string(),
+                path: "src/lib.rs".to_string(),
+                line: "42".to_string(),
+                body: "Can this be a helper?".to_string(),
+                created_at: "2026-06-14T12:00:00Z".to_string(),
+            }],
+            files: vec!["src/lib.rs".to_string()],
+            failing_checks: vec!["cargo test".to_string()],
+        });
+
+        let prompt = build_review_fix_prompt(&session).unwrap();
+
+        assert!(prompt.starts_with(
+            "Here are some comments on PR 123. If they are applicable, fix them. Otherwise, say why not."
+        ));
+        assert!(prompt.contains("Please simplify this branch."));
+        assert!(prompt.contains("This should mention the fallback behavior."));
+        assert!(prompt.contains("Can this be a helper?"));
+        assert!(!prompt.contains("Review Packet"));
+        assert!(!prompt.contains("Changed Files"));
+        assert!(!prompt.contains("Failing Checks"));
+        assert!(!prompt.contains("src/lib.rs\n-"));
+        assert!(!prompt.contains("cargo test"));
+    }
+
+    fn test_session(details: PrDetails) -> Session {
+        Session {
+            path: PathBuf::from("/repo/worktree"),
+            path_display: "/repo/worktree".to_string(),
+            branch: "feature".to_string(),
+            prompt_summary: String::new(),
+            adopted: false,
+            hidden: false,
+            status_label: "clean".to_string(),
+            agent: None,
+            agent_output: VecDeque::new(),
+            agent_state: AgentState::Idle,
+            pr: PrCache {
+                summary: Some(PrSummary {
+                    number: 123,
+                    title: "Title".to_string(),
+                    body: String::new(),
+                    url: "https://example.test/pr/123".to_string(),
+                    state: "OPEN".to_string(),
+                    review_decision: "CHANGES_REQUESTED".to_string(),
+                    head_ref: "feature".to_string(),
+                    base_ref: "main".to_string(),
+                    head_sha: "abc123".to_string(),
+                    updated_at: "2026-06-14T12:00:00Z".to_string(),
+                    check_status: "SUCCESS".to_string(),
+                    comment_count: 3,
+                    merged: false,
+                    draft: false,
+                }),
+                details: Some(details),
+                ..PrCache::default()
+            },
+        }
+    }
 }

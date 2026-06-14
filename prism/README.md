@@ -31,7 +31,7 @@ Implemented so far:
 - optional configured checks for `pre_pr`, `pre_push`, and `review_fix`
 - deterministic review packets under `.agent/review/<pr-number>.md`
 - inline review comment fetch through `gh api`
-- explicit review-fix agent launch, `fix: code review` commit, and push actions
+- explicit review-fix prompt staging, review-fix commit, and push actions
 - plan creation prompts that ask the selected agent to create or update `plans/<branch>.md`
 - explicit plan execution through `codex-plan --file ...`
 - remove-from-board and local delete flows for sessions
@@ -91,8 +91,10 @@ Runtime diagnostics:
 Review loop keys:
 
 - `R` refreshes PR details and writes `.agent/review/<pr-number>.md`.
-- `f` writes the review packet and starts a fresh agent session with it as context.
-- `m` stages all changes and commits `fix: code review` after confirmation.
+- `f` refreshes PR comments, creates the interactive agent session if needed,
+  and pastes the comment-only review-fix prompt without submitting it.
+- `m` stages all changes and commits with an editable default message of
+  `fix: code review`.
 - `u` pushes the selected branch, confirming first when no upstream exists.
 
 Plan keys:

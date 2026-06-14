@@ -11,14 +11,14 @@ use crate::github::{
 };
 use crate::plan::{build_plan_prompt, default_plan_path, infer_total_phases, run_codex_plan};
 use crate::process::{run_configured_commands, run_status};
-use crate::review::write_review_packet;
+use crate::review::{build_review_fix_prompt, write_review_packet};
 use crate::session::{
     append_agent_log, append_runtime_log, clear_hidden, discover_sessions, mark_hidden,
     remove_logs, remove_process_state, remove_task_metadata, save_agent_state, write_task_metadata,
 };
 use crate::tmux::{
     agent_session_running, attach_or_create_agent, ensure_agent_session, kill_agent_session,
-    latest_agent_session_generation,
+    latest_agent_session_generation, paste_agent_prompt,
 };
 use crate::tui::{PrPollKey, PrPollResult, TmuxSlotKey, TmuxWarmupKey, TmuxWarmupResult, Tui};
 use crate::util::{truncate, yes};
@@ -536,20 +536,16 @@ impl Tui {
         }
         let path = self.sessions[self.selected].path.clone();
         run_configured_commands(&self.config.checks.review_fix, &path, "review_fix")?;
-        let packet_path = write_review_packet(&self.sessions[self.selected], &self.config)?;
-        let packet = fs::read_to_string(&packet_path)
-            .map_err(|error| format!("read review packet: {error}"))?;
-        let pr_number = self.sessions[self.selected]
-            .pr
-            .summary
-            .as_ref()
-            .map(|summary| summary.number.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        let prompt = format!(
-            "Here are some comments on PR {pr_number}. If they are applicable, fix them. Otherwise, say why not.\n\n{packet}\n\nMake the requested changes, run relevant checks, and summarize what changed."
-        );
-        self.launch_agent(self.selected, &prompt)?;
-        self.show_message("started review-fix agent session")?;
+        let prompt = build_review_fix_prompt(&self.sessions[self.selected])?;
+        let session = session_for_tmux_warmup(&self.sessions[self.selected]);
+        let slot = tmux_slot_key(&session);
+        let generation = self.tmux_generation_for_slot(&slot);
+        let key = tmux_warmup_key(slot.clone(), generation);
+        self.finish_tmux_warmup_for_key(&key);
+        paste_agent_prompt(&self.repo, &self.config, &session, generation, &prompt)?;
+        let running = agent_session_running(&self.repo, &self.config, &session, generation);
+        self.update_tmux_agent_state_for_slot(&slot, running);
+        self.show_message("pasted review-fix prompt into agent session")?;
         Ok(())
     }
 
@@ -562,8 +558,9 @@ impl Tui {
             self.show_message("nothing to commit")?;
             return Ok(());
         }
-        let answer = self.prompt_line("Commit all changes as 'fix: code review'? [y/N] ")?;
-        if !yes(&answer) {
+        let message = self.prompt_line_with_default("Commit message: ", "fix: code review")?;
+        let message = message.trim();
+        if message.is_empty() {
             return Ok(());
         }
         run_status(
@@ -576,10 +573,11 @@ impl Tui {
             Command::new(self.config.tool("git"))
                 .arg("-C")
                 .arg(&path)
-                .args(["commit", "-m", "fix: code review"]),
+                .args(["commit", "-m"])
+                .arg(message),
         )?;
         self.refresh_sessions()?;
-        self.show_message("created commit: fix: code review")?;
+        self.show_message(&format!("created commit: {message}"))?;
         Ok(())
     }
 

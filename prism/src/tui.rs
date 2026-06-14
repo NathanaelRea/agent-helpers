@@ -347,7 +347,7 @@ impl Tui {
             "x            run plan",
             "P            create or show PR",
             "R            write review packet",
-            "f            start review-fix agent",
+            "f            stage review-fix prompt",
             "m            commit review fix",
             "u            push selected branch",
             "a            remove from board",
@@ -411,9 +411,22 @@ impl Tui {
     }
 
     pub(crate) fn prompt_line(&self, prompt: &str) -> Result<String, String> {
+        self.prompt_line_with_initial(prompt, "")
+    }
+
+    pub(crate) fn prompt_line_with_default(
+        &self,
+        prompt: &str,
+        default: &str,
+    ) -> Result<String, String> {
+        self.prompt_line_with_initial(prompt, default)
+    }
+
+    fn prompt_line_with_initial(&self, prompt: &str, initial: &str) -> Result<String, String> {
         print!("\x1b[{};1H\x1b[2K\x1b[?25h{}", terminal_size().1, prompt);
+        let mut input = initial.to_string();
+        print!("{input}");
         io::stdout().flush().map_err(|error| error.to_string())?;
-        let mut input = String::new();
         let mut stdin = io::stdin();
         let mut byte = [0_u8; 1];
         loop {
