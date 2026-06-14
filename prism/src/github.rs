@@ -106,7 +106,7 @@ pub fn load_pr_cache(repo: &Repository, branch: &str) -> PrCache {
         head_sha: json_string_field(&text, "headRefOid").unwrap_or_default(),
         updated_at: json_string_field(&text, "updatedAt").unwrap_or_default(),
         check_status: json_string_field(&text, "checkStatus").unwrap_or_else(|| "unknown".into()),
-        merged: json_bool_field(&text, "merged").unwrap_or(false),
+        merged: parse_merged_status(&text),
         draft: json_bool_field(&text, "isDraft").unwrap_or(false),
     };
     let last_refreshed = json_string_field(&text, "lastRefreshed");
@@ -179,7 +179,7 @@ fn fetch_pr_summary(
         "headRefOid",
         "updatedAt",
         "statusCheckRollup",
-        "merged",
+        "mergedAt",
         "isDraft",
     ]
     .join(",");
@@ -224,7 +224,7 @@ fn fetch_pr_summary(
         head_sha: json_string_field(&raw, "headRefOid").unwrap_or_default(),
         updated_at: json_string_field(&raw, "updatedAt").unwrap_or_default(),
         check_status: parse_check_status(&raw),
-        merged: json_bool_field(&raw, "merged").unwrap_or(false),
+        merged: parse_merged_status(&raw),
         draft: json_bool_field(&raw, "isDraft").unwrap_or(false),
     };
     Ok(Some((summary, raw)))
@@ -393,6 +393,18 @@ fn collect_failing_checks(raw: &str) -> Vec<String> {
         .collect()
 }
 
+fn parse_merged_status(raw: &str) -> bool {
+    json_bool_field(raw, "merged").unwrap_or_else(|| {
+        json_string_field(raw, "mergedAt")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                json_string_field(raw, "state")
+                    .map(|state| state == "MERGED")
+                    .unwrap_or(false)
+            })
+    })
+}
+
 fn pr_cache_path(repo: &Repository, branch: &str) -> std::path::PathBuf {
     repo.prism_dir()
         .join("pr")
@@ -437,13 +449,19 @@ fn save_pr_cache(repo: &Repository, branch: &str, cache: &PrCache) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Checks, Config, EscapeKey};
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn pr_json_helpers_parse_summary_fields() {
         let raw = r#"{
             "number": 42,
             "title": "Fix review",
-            "merged": false,
+            "mergedAt": "2026-01-01T00:00:00Z",
             "isDraft": true,
             "comments": [{"body": "hello"}],
             "reviews": [{"state": "CHANGES_REQUESTED"}],
@@ -452,6 +470,7 @@ mod tests {
         }"#;
         assert_eq!(json_u64_field(raw, "number"), Some(42));
         assert_eq!(json_bool_field(raw, "isDraft"), Some(true));
+        assert!(parse_merged_status(raw));
         assert_eq!(parse_check_status(raw), "failed");
         let details = parse_pr_details(raw);
         assert_eq!(details.files, vec!["src/main.rs"]);
@@ -476,5 +495,85 @@ mod tests {
         assert_eq!(comments[0].path, "src/main.rs");
         assert_eq!(comments[0].line, "12");
         assert_eq!(comments[0].author, "reviewer");
+    }
+
+    #[test]
+    fn fetch_pr_summary_uses_merged_at_instead_of_removed_merged_field() {
+        let temp = unique_temp_dir("prism-gh-summary-test");
+        fs::create_dir_all(&temp).unwrap();
+        let gh = temp.join("gh");
+        fs::write(
+            &gh,
+            r#"#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in
+    merged|merged,*|*,merged|*,merged,*)
+      echo 'Unknown JSON field: "merged"' >&2
+      exit 1
+      ;;
+  esac
+done
+cat <<'JSON'
+{
+  "number": 7,
+  "title": "Test PR",
+  "url": "https://github.com/example/repo/pull/7",
+  "state": "CLOSED",
+  "reviewDecision": "",
+  "headRefName": "feature",
+  "baseRefName": "main",
+  "headRefOid": "abc123",
+  "updatedAt": "2026-01-01T00:00:00Z",
+  "statusCheckRollup": [],
+  "mergedAt": "2026-01-02T00:00:00Z",
+  "isDraft": false
+}
+JSON
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&gh).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&gh, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("gh".to_string(), gh.display().to_string());
+
+        let summary = fetch_pr_summary(&temp, "feature", &config)
+            .unwrap()
+            .unwrap()
+            .0;
+
+        assert_eq!(summary.number, 7);
+        assert!(summary.merged);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    fn test_config() -> Config {
+        Config {
+            default_agent: "ask".to_string(),
+            default_base: None,
+            plan_dir: "plans".to_string(),
+            review_packet_dir: ".agent/review".to_string(),
+            worktree_command: "wt".to_string(),
+            escape_key: EscapeKey::EscEsc,
+            checks: Checks::default(),
+            tools: BTreeMap::new(),
+            agent_commands: BTreeMap::new(),
+            agent_prompt_modes: BTreeMap::new(),
+            user_path: PathBuf::from("/tmp/prism-user-config.toml"),
+            repo_path: PathBuf::from("/tmp/prism-repo-config.toml"),
+        }
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
     }
 }
