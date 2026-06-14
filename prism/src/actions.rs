@@ -13,7 +13,7 @@ use crate::session::{
     remove_process_state, remove_task_metadata, save_agent_state, write_task_metadata,
 };
 use crate::tmux::{agent_session_running, attach_or_create_agent};
-use crate::tui::Tui;
+use crate::tui::{PrPollKey, PrPollResult, Tui};
 use crate::util::{truncate, yes};
 
 impl Tui {
@@ -139,23 +139,43 @@ impl Tui {
     }
 
     pub(crate) fn poll_pull_requests(&mut self, force: bool) -> bool {
-        let mut changed = false;
+        let changed = self.drain_pr_poll_results();
         for session in &mut self.sessions {
             let due = session
                 .pr
                 .last_polled
                 .map(|last| last.elapsed() >= PR_POLL_INTERVAL)
                 .unwrap_or(true);
-            if force || due {
+            let key = pr_poll_key(session);
+            if (force || due) && !self.pr_polls_in_flight.contains(&key) {
+                let repo = self.repo.clone();
+                let config = self.config.clone();
+                let branch = session.branch.clone();
+                let path = session.path.clone();
+                let mut cache = session.pr.clone();
+                let tx = self.pr_poll_tx.clone();
+                session.pr.last_polled = Some(std::time::Instant::now());
+                self.pr_polls_in_flight.insert(key.clone());
+                std::thread::spawn(move || {
+                    refresh_pr_cache(&repo, &branch, &mut cache, &path, &config, force);
+                    let _ = tx.send(PrPollResult { key, cache });
+                });
+            }
+        }
+        changed
+    }
+
+    fn drain_pr_poll_results(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(result) = self.pr_poll_rx.try_recv() {
+            self.pr_polls_in_flight.remove(&result.key);
+            if let Some(session) = self
+                .sessions
+                .iter_mut()
+                .find(|session| pr_poll_key(session) == result.key)
+            {
                 let before = pr_render_signature(&session.pr);
-                refresh_pr_cache(
-                    &self.repo,
-                    &session.branch,
-                    &mut session.pr,
-                    &session.path,
-                    &self.config,
-                    force,
-                );
+                session.pr = result.cache;
                 changed |= before != pr_render_signature(&session.pr);
             }
         }
@@ -547,11 +567,28 @@ fn pr_render_signature(cache: &PrCache) -> String {
     )
 }
 
+fn pr_poll_key(session: &crate::session::Session) -> PrPollKey {
+    PrPollKey {
+        branch: session.branch.clone(),
+        path: session.path.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::agent::AgentState;
+    use crate::config::{Checks, Config, EscapeKey};
+    use crate::github::PrCache;
+    use crate::repo::Repository;
+    use crate::session::Session;
+    use crate::tui::Tui;
 
     use super::tmux_agent_state;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn idle_tmux_opencode_session_does_not_count_as_running_agent() {
@@ -572,5 +609,86 @@ mod tests {
         let state = tmux_agent_state(AgentState::Running, true, true);
 
         assert_eq!(state, None);
+    }
+
+    #[test]
+    fn automatic_pr_polling_does_not_block_input_loop() {
+        let temp = unique_temp_dir("prism-pr-poll-test");
+        fs::create_dir_all(&temp).unwrap();
+        let gh = temp.join("gh");
+        fs::write(
+            &gh,
+            r#"#!/bin/sh
+sleep 1
+echo 'no pull requests found' >&2
+exit 1
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&gh).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&gh, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("gh".to_string(), gh.display().to_string());
+        let repo = Repository { root: temp.clone() };
+        let session = test_session(temp.join("worktree"), "feature");
+        let mut tui = Tui::new(repo, config, vec![session], false);
+
+        let started = Instant::now();
+        let changed = tui.poll_pull_requests(false);
+
+        assert!(!changed);
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "automatic PR polling blocked for {:?}",
+            started.elapsed()
+        );
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    fn test_session(path: PathBuf, branch: &str) -> Session {
+        fs::create_dir_all(&path).unwrap();
+        Session {
+            path: path.clone(),
+            path_display: path.display().to_string(),
+            branch: branch.to_string(),
+            prompt_summary: String::new(),
+            adopted: false,
+            hidden: false,
+            status_label: "clean".to_string(),
+            agent: None,
+            agent_output: VecDeque::new(),
+            agent_state: AgentState::Idle,
+            pr: PrCache::default(),
+        }
+    }
+
+    fn test_config() -> Config {
+        Config {
+            default_agent: "ask".to_string(),
+            default_base: None,
+            plan_dir: "plans".to_string(),
+            review_packet_dir: ".agent/review".to_string(),
+            worktree_command: "wt".to_string(),
+            escape_key: EscapeKey::EscEsc,
+            checks: Checks::default(),
+            tools: BTreeMap::new(),
+            agent_commands: BTreeMap::new(),
+            agent_prompt_modes: BTreeMap::new(),
+            user_path: PathBuf::from("/tmp/prism-user-config.toml"),
+            repo_path: PathBuf::from("/tmp/prism-repo-config.toml"),
+        }
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
     }
 }

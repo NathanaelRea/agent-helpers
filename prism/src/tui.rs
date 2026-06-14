@@ -1,9 +1,13 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::io::{self, ErrorKind, Read, Write};
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::agent::AgentState;
 use crate::config::Config;
+use crate::github::PrCache;
 use crate::input::{Key, KeyInput};
 use crate::repo::Repository;
 use crate::session::{Session, append_runtime_log};
@@ -17,7 +21,21 @@ pub struct Tui {
     pub(crate) sessions: Vec<Session>,
     pub(crate) selected: usize,
     pub(crate) allow_dirty: bool,
+    pub(crate) pr_poll_tx: Sender<PrPollResult>,
+    pub(crate) pr_poll_rx: Receiver<PrPollResult>,
+    pub(crate) pr_polls_in_flight: BTreeSet<PrPollKey>,
     status_message: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PrPollKey {
+    pub branch: String,
+    pub path: PathBuf,
+}
+
+pub(crate) struct PrPollResult {
+    pub key: PrPollKey,
+    pub cache: PrCache,
 }
 
 impl Tui {
@@ -27,12 +45,16 @@ impl Tui {
         sessions: Vec<Session>,
         allow_dirty: bool,
     ) -> Self {
+        let (pr_poll_tx, pr_poll_rx) = mpsc::channel();
         Self {
             repo,
             config,
             sessions,
             selected: 0,
             allow_dirty,
+            pr_poll_tx,
+            pr_poll_rx,
+            pr_polls_in_flight: BTreeSet::new(),
             status_message: None,
         }
     }

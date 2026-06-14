@@ -13,7 +13,7 @@ use crate::util::{safe_branch_filename, timestamp_label};
 
 pub const PR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct PrCache {
     pub summary: Option<PrSummary>,
     pub details: Option<PrDetails>,
