@@ -92,6 +92,7 @@ pub struct PrReviewComment {
     pub line: String,
     pub body: String,
     pub created_at: String,
+    pub resolved: bool,
 }
 
 pub fn load_pr_cache(repo: &Repository, branch: &str) -> PrCache {
@@ -499,29 +500,49 @@ fn fetch_inline_review_comments(
     pr_number: u64,
     config: &Config,
 ) -> Result<Vec<PrReviewComment>, String> {
-    let owner_repo = run_capture(
-        Command::new(config.tool("gh"))
-            .arg("repo")
-            .arg("view")
-            .arg("--json")
-            .arg("nameWithOwner")
-            .arg("-q")
-            .arg(".nameWithOwner")
-            .current_dir(path),
-    )?;
-    let endpoint = format!(
-        "repos/{}/pulls/{}/comments?per_page=100",
-        owner_repo.trim(),
-        pr_number
-    );
+    let (owner, name) = github_owner_repo(path, config)?;
     let raw = run_capture(
         Command::new(config.tool("gh"))
             .arg("api")
-            .arg(endpoint)
+            .arg("graphql")
+            .arg("-F")
+            .arg(format!("owner={owner}"))
+            .arg("-F")
+            .arg(format!("name={name}"))
+            .arg("-F")
+            .arg(format!("number={pr_number}"))
+            .arg("-f")
+            .arg(format!("query={PR_REVIEW_THREADS_QUERY}"))
             .current_dir(path),
     )?;
-    Ok(parse_inline_review_comments(&raw))
+    Ok(parse_review_thread_comments(&raw))
 }
+
+const PR_REVIEW_THREADS_QUERY: &str = r#"
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes {
+          isResolved
+          comments(first: 100) {
+            nodes {
+              author {
+                login
+              }
+              path
+              line
+              originalLine
+              body
+              createdAt
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
 
 fn parse_pr_comments(raw: &str) -> Vec<PrComment> {
     json_objects_in_array(raw, "comments")
@@ -568,10 +589,46 @@ pub fn parse_inline_review_comments(raw: &str) -> Vec<PrReviewComment> {
             created_at: json_string_field(object, "created_at")
                 .or_else(|| json_string_field(object, "createdAt"))
                 .unwrap_or_default(),
+            resolved: false,
         })
         .filter(|comment| !comment.body.trim().is_empty())
         .take(100)
         .collect()
+}
+
+pub fn parse_review_thread_comments(raw: &str) -> Vec<PrReviewComment> {
+    let Some(review_threads) = json_object_field(raw, "reviewThreads") else {
+        return Vec::new();
+    };
+    let mut comments = Vec::new();
+    for thread in json_objects_in_array(review_threads, "nodes") {
+        let resolved = json_bool_field(thread, "isResolved").unwrap_or(false);
+        let Some(thread_comments) = json_object_field(thread, "comments") else {
+            continue;
+        };
+        for object in json_objects_in_array(thread_comments, "nodes") {
+            if comments.len() >= 100 {
+                return comments;
+            }
+            let comment = PrReviewComment {
+                author: json_login_field(object).unwrap_or_default(),
+                path: json_string_field(object, "path").unwrap_or_default(),
+                line: json_u64_field(object, "line")
+                    .or_else(|| json_u64_field(object, "originalLine"))
+                    .map(|line| line.to_string())
+                    .unwrap_or_default(),
+                body: json_string_field(object, "body").unwrap_or_default(),
+                created_at: json_string_field(object, "createdAt")
+                    .or_else(|| json_string_field(object, "created_at"))
+                    .unwrap_or_default(),
+                resolved,
+            };
+            if !comment.body.trim().is_empty() {
+                comments.push(comment);
+            }
+        }
+    }
+    comments
 }
 
 pub fn parse_check_status(raw: &str) -> String {
@@ -831,6 +888,63 @@ mod tests {
         assert_eq!(comments[0].path, "src/main.rs");
         assert_eq!(comments[0].line, "12");
         assert_eq!(comments[0].author, "reviewer");
+        assert!(!comments[0].resolved);
+    }
+
+    #[test]
+    fn parses_review_thread_resolution_status() {
+        let raw = r#"{
+          "data": {
+            "repository": {
+              "pullRequest": {
+                "reviewThreads": {
+                  "nodes": [
+                    {
+                      "isResolved": true,
+                      "comments": {
+                        "nodes": [
+                          {
+                            "path": "src/main.rs",
+                            "line": 12,
+                            "body": "please simplify",
+                            "createdAt": "2026-01-01T00:00:00Z",
+                            "author": {"login": "reviewer"}
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "isResolved": false,
+                      "comments": {
+                        "nodes": [
+                          {
+                            "path": "src/lib.rs",
+                            "originalLine": 20,
+                            "body": "still needs work",
+                            "createdAt": "2026-01-02T00:00:00Z",
+                            "author": {"login": "maintainer"}
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }"#;
+
+        let comments = parse_review_thread_comments(raw);
+
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].author, "reviewer");
+        assert_eq!(comments[0].path, "src/main.rs");
+        assert_eq!(comments[0].line, "12");
+        assert!(comments[0].resolved);
+        assert_eq!(comments[1].author, "maintainer");
+        assert_eq!(comments[1].path, "src/lib.rs");
+        assert_eq!(comments[1].line, "20");
+        assert!(!comments[1].resolved);
     }
 
     #[test]

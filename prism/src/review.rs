@@ -42,7 +42,6 @@ pub fn build_review_fix_prompt(session: &Session) -> Result<String, String> {
         "Here are some comments on PR {}. If they are applicable, fix them. Otherwise, say why not.\n\n",
         summary.number
     );
-    prompt.push_str("## PR Comments\n\n");
 
     let mut wrote_comment = false;
     for comment in &comments {
@@ -51,9 +50,8 @@ pub fn build_review_fix_prompt(session: &Session) -> Result<String, String> {
         }
         wrote_comment = true;
         prompt.push_str(&format!(
-            "### Conversation comment from {} {}\n\n{}\n\n",
+            "{}\n{}\n\n",
             empty_dash(&comment.author),
-            empty_dash(&comment.created_at),
             comment.body.trim()
         ));
     }
@@ -64,45 +62,37 @@ pub fn build_review_fix_prompt(session: &Session) -> Result<String, String> {
         }
         wrote_comment = true;
         prompt.push_str(&format!(
-            "### Review {} from {} {}\n\n{}\n\n",
-            empty_dash(&review.state),
+            "{}\n{}\n\n",
             empty_dash(&review.author),
-            empty_dash(&review.submitted_at),
             review.body.trim()
         ));
     }
 
-    let mut current_file = String::new();
     for comment in &review_comments {
         if comment.body.trim().is_empty() {
             continue;
         }
-        wrote_comment = true;
-        if comment.path != current_file {
-            current_file = comment.path.clone();
-            prompt.push_str(&format!(
-                "### Inline comments on {}\n\n",
-                empty_dash(&current_file)
-            ));
+        if comment.resolved {
+            continue;
         }
         let line = if comment.line.is_empty() {
-            "-".to_string()
+            String::new()
         } else {
-            format!("line {}", comment.line)
+            format!(" line {}", comment.line)
         };
+        wrote_comment = true;
         prompt.push_str(&format!(
-            "- {} from {} {}:\n\n{}\n\n",
-            line,
+            "{}\n{}{}\n{}\n\n",
             empty_dash(&comment.author),
-            empty_dash(&comment.created_at),
-            indent_markdown_block(comment.body.trim())
+            empty_dash(&comment.path),
+            line,
+            comment.body.trim()
         ));
     }
 
     if !wrote_comment {
         prompt.push_str("No PR comments were found.\n\n");
     }
-    prompt.push_str("Make the requested changes, run relevant checks, and summarize what changed.");
 
     Ok(prompt)
 }
@@ -281,13 +271,24 @@ mod tests {
                 body: "This should mention the fallback behavior.".to_string(),
                 submitted_at: "2026-06-14T11:00:00Z".to_string(),
             }],
-            review_comments: vec![PrReviewComment {
-                author: "carol".to_string(),
-                path: "src/lib.rs".to_string(),
-                line: "42".to_string(),
-                body: "Can this be a helper?".to_string(),
-                created_at: "2026-06-14T12:00:00Z".to_string(),
-            }],
+            review_comments: vec![
+                PrReviewComment {
+                    author: "carol".to_string(),
+                    path: "src/lib.rs".to_string(),
+                    line: "42".to_string(),
+                    body: "This resolved comment should stay out.".to_string(),
+                    created_at: "2026-06-14T12:00:00Z".to_string(),
+                    resolved: true,
+                },
+                PrReviewComment {
+                    author: "dana".to_string(),
+                    path: "src/review.rs".to_string(),
+                    line: "9".to_string(),
+                    body: "Can this be a helper?".to_string(),
+                    created_at: "2026-06-14T12:05:00Z".to_string(),
+                    resolved: false,
+                },
+            ],
             files: vec!["src/lib.rs".to_string()],
             failing_checks: vec!["cargo test".to_string()],
         });
@@ -297,13 +298,24 @@ mod tests {
         assert!(prompt.starts_with(
             "Here are some comments on PR 123. If they are applicable, fix them. Otherwise, say why not."
         ));
+        assert!(prompt.contains("alice\nPlease simplify this branch."));
+        assert!(prompt.contains("bob\nThis should mention the fallback behavior."));
+        assert!(prompt.contains("dana\nsrc/review.rs line 9\nCan this be a helper?"));
         assert!(prompt.contains("Please simplify this branch."));
         assert!(prompt.contains("This should mention the fallback behavior."));
         assert!(prompt.contains("Can this be a helper?"));
+        assert!(!prompt.contains("This resolved comment should stay out."));
+        assert!(!prompt.contains("<open>"));
+        assert!(!prompt.contains("<resolved>"));
+        assert!(!prompt.contains("not resolved"));
+        assert!(!prompt.contains("##"));
+        assert!(!prompt.contains("###"));
         assert!(!prompt.contains("Review Packet"));
+        assert!(!prompt.contains("PR Comments"));
         assert!(!prompt.contains("Changed Files"));
         assert!(!prompt.contains("Failing Checks"));
-        assert!(!prompt.contains("src/lib.rs\n-"));
+        assert!(!prompt.contains("2026-06-14"));
+        assert!(!prompt.contains("Make the requested changes"));
         assert!(!prompt.contains("cargo test"));
     }
 
