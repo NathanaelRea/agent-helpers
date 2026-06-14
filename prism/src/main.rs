@@ -13,6 +13,7 @@ mod review;
 mod session;
 mod setup;
 mod terminal;
+mod tmux;
 mod tui;
 mod util;
 mod view;

@@ -157,7 +157,7 @@ pub(crate) fn render_frame(
     }
 
     let footer = format!(
-        " {mode_label}  i/enter agent  c create  n plan  x run-plan  P PR  R packet  f fix  m commit  u push  a remove  D delete  q quit  repo {} ",
+        " {mode_label}  i/enter attach  c create  n plan  x run-plan  P PR  R packet  f fix  m commit  u push  a remove  D delete  q quit  repo {} ",
         repo.root.display()
     );
     if pr_width > 0 {

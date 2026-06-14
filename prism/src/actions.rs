@@ -12,6 +12,7 @@ use crate::session::{
     append_agent_log, clear_hidden, discover_sessions, mark_hidden, remove_logs,
     remove_process_state, remove_task_metadata, save_agent_state, write_task_metadata,
 };
+use crate::tmux::{agent_session_exists, attach_or_create_agent};
 use crate::tui::Tui;
 use crate::util::{truncate, yes};
 
@@ -73,8 +74,8 @@ impl Tui {
             write_task_metadata(&self.repo, &self.sessions[index], &initial_prompt)?;
             self.sessions[index].prompt_summary = truncate(&initial_prompt.replace('\n', " "), 50);
             self.sessions[index].adopted = true;
+            self.launch_agent(index, &initial_prompt)?;
         }
-        self.launch_agent(index, &initial_prompt)?;
         Ok(())
     }
 
@@ -159,6 +160,33 @@ impl Tui {
             }
         }
         changed
+    }
+
+    pub(crate) fn attach_selected_agent_terminal(&mut self) -> Result<(), String> {
+        if self.selected >= self.sessions.len() {
+            return Ok(());
+        }
+        attach_or_create_agent(&self.repo, &self.config, &self.sessions[self.selected])?;
+        self.refresh_tmux_agent_states();
+        Ok(())
+    }
+
+    pub(crate) fn refresh_tmux_agent_states(&mut self) {
+        for session in &mut self.sessions {
+            let state = if agent_session_exists(&self.repo, &self.config, session) {
+                Some(AgentState::Running)
+            } else if session.agent_state == AgentState::NeedsRestart {
+                Some(AgentState::ExitedOk)
+            } else {
+                None
+            };
+            if let Some(state) = state {
+                if session.agent_state != state {
+                    session.agent_state = state;
+                    let _ = save_agent_state(&self.repo, &session.branch, state);
+                }
+            }
+        }
     }
 
     pub(crate) fn create_or_update_pr(&mut self) -> Result<(), String> {

@@ -15,8 +15,8 @@ Implemented so far:
 - `c` create-session flow using `wt switch -c <branch>`
 - dirty-worktree guard for session creation, overridable with `--allow-dirty`
 - task prompt metadata under `.prism/tasks/<branch>.json`
-- embedded PTY launch for the selected agent backend
-- agent input mode with `i`/Enter and configurable `escape_key`
+- tmux-backed persistent agent CLI sessions with `i`/Enter attach
+- embedded PTY launch for prompt-driven agent actions
 - built-in backend presets for `codex`, `pi`, `claude`, `opencode`, and `aider`
 - custom command-template backends via config
 - backend prompt delivery modes: `stdin`, `argument`, `temp-file`, and `interactive`
@@ -53,9 +53,9 @@ prism config
 prism run-plan plans/my-branch.md
 ```
 
-Required tools for the TUI are `git`, `gh`, the configured worktree command
-(`wt` by default), and one configured agent backend. `codex-plan` is optional
-and only needed for the temporary `x`/`run-plan` path.
+Required tools for the TUI are `git`, `gh`, `tmux`, the configured worktree
+command (`wt` by default), and one configured agent backend. `codex-plan` is
+optional and only needed for the temporary `x`/`run-plan` path.
 
 On startup, Prism checks the repository layout before opening the board. If the
 current checkout is not on the default branch, no additional worktree sessions
@@ -65,6 +65,12 @@ worktree and switch the original checkout back to the default branch.
 
 The TUI supports `c`, `i`/Enter, `n`, `x`, `P`, `R`, `f`, `m`, `u`, `a`, `D`,
 `j`/`k`, arrow keys, `g g`, `G`, `r`, and `q`.
+
+Pressing `i`/Enter attaches to a persistent tmux session for the selected
+worktree. If that worktree does not have an agent tmux session yet, Prism starts
+one in the worktree directory with the configured default agent command. Detach
+from tmux, for example with `Ctrl-b d`, to return to Prism. Other worktree agent
+sessions keep running in parallel while detached.
 
 PR polling is read-only. Prism does not commit, push, or create a pull request
 unless you press the matching explicit action and confirm the prompt. The `P`
@@ -79,6 +85,7 @@ Runtime diagnostics:
 
 - `.prism/logs/<branch>.log` stores raw agent output for a branch.
 - `.prism/runtime.log` stores Prism action failures shown in the TUI status line.
+- tmux agent sessions are named `prism-<repo-hash>-<branch>`.
 - PR refresh errors are cached and shown in the PR panel.
 
 Review loop keys:
@@ -120,7 +127,10 @@ Backend notes:
 
 - Built-in `codex`, `pi`, `claude`, `opencode`, and `aider` adapters default to
   `stdin`, which starts the configured command in Prism's PTY and writes the
-  initial prompt into it.
+  initial prompt into it for prompt-driven actions.
+- The `i`/Enter tmux attach path starts the configured agent command directly
+  without sending an initial prompt. Custom commands used with `i`/Enter should
+  be interactive commands and must not contain `{prompt}` or `{prompt_file}`.
 - `argument` appends the prompt as one argv value, or replaces `{prompt}` when
   present in the command template.
 - `temp-file` writes the prompt to a temporary markdown file and appends that

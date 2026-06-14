@@ -1,18 +1,13 @@
 use std::io::{self, ErrorKind, Read, Write};
 
 use crate::agent::AgentState;
-use crate::config::{Config, EscapeKey};
+use crate::config::Config;
 use crate::input::{Key, KeyInput};
 use crate::repo::Repository;
 use crate::session::{Session, append_runtime_log};
 use crate::terminal::{RawTerminal, stdin_is_tty, terminal_size};
 use crate::util::{truncate_line, yes};
 use crate::view;
-
-enum Mode {
-    Normal,
-    Agent { pending_escape: bool },
-}
 
 pub struct Tui {
     pub(crate) repo: Repository,
@@ -21,7 +16,6 @@ pub struct Tui {
     pub(crate) selected: usize,
     pub(crate) allow_dirty: bool,
     status_message: Option<String>,
-    mode: Mode,
 }
 
 impl Tui {
@@ -38,7 +32,6 @@ impl Tui {
             selected: 0,
             allow_dirty,
             status_message: None,
-            mode: Mode::Normal,
         }
     }
 
@@ -48,6 +41,7 @@ impl Tui {
         }
 
         let mut raw = RawTerminal::enter()?;
+        self.refresh_tmux_agent_states();
         self.draw()?;
         let mut stdin = io::stdin();
         let mut buffer = [0_u8; 64];
@@ -75,11 +69,6 @@ impl Tui {
                 Err(error) => return Err(error.to_string()),
             };
             if count == 0 {
-                continue;
-            }
-
-            if matches!(self.mode, Mode::Agent { .. }) {
-                self.handle_agent_input(&buffer[..count])?;
                 continue;
             }
 
@@ -112,11 +101,12 @@ impl Tui {
                     }
                     Key::AgentMode => {
                         pending_g = false;
-                        self.enter_agent_mode()?;
+                        self.enter_agent_mode(&mut raw)?;
                     }
                     Key::Refresh => {
                         pending_g = false;
                         self.refresh_sessions()?;
+                        self.refresh_tmux_agent_states();
                         self.poll_pull_requests(true);
                     }
                     Key::PullRequest => {
@@ -212,64 +202,20 @@ impl Tui {
         Ok(yes(&answer))
     }
 
-    fn enter_agent_mode(&mut self) -> Result<(), String> {
-        let Some(session) = self.sessions.get(self.selected) else {
-            return Ok(());
-        };
-        if session.agent.is_none() {
-            self.show_message("no live agent PTY for selected session")?;
+    fn enter_agent_mode(&mut self, raw: &mut RawTerminal) -> Result<(), String> {
+        if self.selected >= self.sessions.len() {
             return Ok(());
         }
-        self.mode = Mode::Agent {
-            pending_escape: false,
-        };
-        self.show_message(&format!(
-            "agent mode; exit with {}",
-            self.config.escape_key.label()
-        ))
-    }
-
-    fn handle_agent_input(&mut self, bytes: &[u8]) -> Result<(), String> {
-        let escape_key = self.config.escape_key;
-        for byte in bytes {
-            match (&mut self.mode, escape_key, *byte) {
-                (Mode::Agent { .. }, EscapeKey::CtrlSpace, 0) => {
-                    self.mode = Mode::Normal;
-                    self.show_message("normal mode")?;
-                    continue;
-                }
-                (Mode::Agent { pending_escape }, EscapeKey::EscEsc, b'\x1b')
-                    if !*pending_escape =>
-                {
-                    *pending_escape = true;
-                    continue;
-                }
-                (Mode::Agent { pending_escape }, EscapeKey::EscEsc, b'\x1b') if *pending_escape => {
-                    *pending_escape = false;
-                    self.mode = Mode::Normal;
-                    self.show_message("normal mode")?;
-                    continue;
-                }
-                (Mode::Agent { pending_escape }, EscapeKey::EscEsc, byte) if *pending_escape => {
-                    *pending_escape = false;
-                    self.write_to_selected_agent(&[b'\x1b', byte])?;
-                }
-                _ => self.write_to_selected_agent(&[*byte])?,
-            }
+        raw.suspend()?;
+        let result = self.attach_selected_agent_terminal();
+        let resume_result = raw.resume();
+        self.refresh_sessions()?;
+        self.refresh_tmux_agent_states();
+        resume_result?;
+        if let Err(error) = result {
+            self.show_error("agent terminal failed", &error)?;
         }
         Ok(())
-    }
-
-    fn write_to_selected_agent(&mut self, bytes: &[u8]) -> Result<(), String> {
-        let Some(session) = self.sessions.get_mut(self.selected) else {
-            return Ok(());
-        };
-        let Some(agent) = session.agent.as_mut() else {
-            self.mode = Mode::Normal;
-            self.show_message("agent exited")?;
-            return Ok(());
-        };
-        agent.write_all(bytes)
     }
 
     pub(crate) fn prompt_line(&self, prompt: &str) -> Result<String, String> {
@@ -346,16 +292,12 @@ impl Tui {
     }
 
     fn draw(&self) -> Result<(), String> {
-        let mode_label = match self.mode {
-            Mode::Normal => "normal",
-            Mode::Agent { .. } => "agent",
-        };
         view::draw(
             &self.repo,
             &self.config,
             &self.sessions,
             self.selected,
-            mode_label,
+            "normal",
             self.status_message.as_deref(),
         )
     }

@@ -82,6 +82,7 @@ impl Config {
             ("wt", "wt"),
             ("gh", "gh"),
             ("git", "git"),
+            ("tmux", "tmux"),
             ("codex", "codex"),
             ("pi", "pi"),
             ("claude", "claude"),
@@ -256,6 +257,7 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
 
     print_tool_status("git", &config.tool("git"), true);
     print_tool_status("gh", &config.tool("gh"), true);
+    print_tool_status("tmux", &config.tool("tmux"), true);
     print_tool_status(
         &config.worktree_command,
         &config.tool(&config.worktree_command),
@@ -328,6 +330,7 @@ pub fn ensure_required_tools(config: &Config) -> Result<(), String> {
     let required = [
         ("git", config.tool("git")),
         ("gh", config.tool("gh")),
+        ("tmux", config.tool("tmux")),
         (
             config.worktree_command.as_str(),
             config.tool(&config.worktree_command),
