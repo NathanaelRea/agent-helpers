@@ -24,9 +24,9 @@ Implemented so far:
 - lightweight process state in SQLite and raw agent logs under `~/.config/prism/repos/<repo>/logs/`
 - persistent TUI status line and action failure log under `~/.config/prism/repos/<repo>/runtime.log`
 - current-branch GitHub pull request detection with a right-side PR panel
-- 10-second PR status/check polling through `gh pr view`
-- cached PR summary refresh in SQLite, with detail refresh when comments,
-  reviews, checks, files, or head SHA change
+- 15-second repo-wide PR summary/check polling through GitHub GraphQL
+- cached PR summary refresh in SQLite, with selected-PR detail refresh at most
+  every 30 seconds
 - explicit `P` flow to push a clean branch and create a PR with `gh pr create --fill`
 - optional configured checks for `pre_pr`, `pre_push`, and `review_fix`
 - deterministic review packets under `.agent/review/<pr-number>.md`

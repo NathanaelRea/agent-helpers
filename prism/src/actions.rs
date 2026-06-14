@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use crate::agent::{AgentAdapter, AgentProcess, AgentState};
 use crate::git::{has_upstream, selected_dirty, worktree_dirty};
-use crate::github::{PR_POLL_INTERVAL, PrCache, refresh_pr_cache, remove_pr_cache};
+use crate::github::{
+    PR_SUMMARY_POLL_INTERVAL, PrCache, fetch_pr_summary_index, pr_details_due, refresh_pr_cache,
+    refresh_pr_details_cache, refresh_pr_summary_index, remove_pr_cache,
+};
 use crate::plan::{build_plan_prompt, default_plan_path, infer_total_phases, run_codex_plan};
 use crate::process::{run_configured_commands, run_status};
 use crate::review::write_review_packet;
@@ -144,25 +147,36 @@ impl Tui {
 
     pub(crate) fn poll_pull_requests(&mut self, force: bool) -> bool {
         let changed = self.drain_pr_poll_results();
-        for session in &mut self.sessions {
-            let due = session
-                .pr
-                .last_polled
-                .map(|last| last.elapsed() >= PR_POLL_INTERVAL)
-                .unwrap_or(true);
+        let summaries_due = self
+            .pr_summary_last_polled
+            .map(|last| last.elapsed() >= PR_SUMMARY_POLL_INTERVAL)
+            .unwrap_or(true);
+        if (force || summaries_due) && !self.pr_summary_poll_in_flight {
+            let path = self.repo.root.clone();
+            let config = self.config.clone();
+            let tx = self.pr_poll_tx.clone();
+            self.pr_summary_last_polled = Some(std::time::Instant::now());
+            self.pr_summary_poll_in_flight = true;
+            std::thread::spawn(move || {
+                let summaries = fetch_pr_summary_index(&path, &config);
+                let _ = tx.send(PrPollResult::Summary { summaries });
+            });
+        }
+
+        if let Some(session) = self.sessions.get_mut(self.selected) {
             let key = pr_poll_key(session);
-            if (force || due) && !self.pr_polls_in_flight.contains(&key) {
-                let repo = self.repo.clone();
+            if pr_details_due(&session.pr) && !self.pr_polls_in_flight.contains(&key) {
                 let config = self.config.clone();
                 let branch = session.branch.clone();
                 let path = session.path.clone();
                 let mut cache = session.pr.clone();
                 let tx = self.pr_poll_tx.clone();
-                session.pr.last_polled = Some(std::time::Instant::now());
+                session.pr.details_last_polled = Some(std::time::Instant::now());
+                cache.details_last_polled = session.pr.details_last_polled;
                 self.pr_polls_in_flight.insert(key.clone());
                 std::thread::spawn(move || {
-                    refresh_pr_cache(&repo, &branch, &mut cache, &path, &config, force);
-                    let _ = tx.send(PrPollResult { key, cache });
+                    refresh_pr_details_cache(&branch, &mut cache, &path, &config);
+                    let _ = tx.send(PrPollResult::Details { key, cache });
                 });
             }
         }
@@ -172,15 +186,49 @@ impl Tui {
     fn drain_pr_poll_results(&mut self) -> bool {
         let mut changed = false;
         while let Ok(result) = self.pr_poll_rx.try_recv() {
-            self.pr_polls_in_flight.remove(&result.key);
-            if let Some(session) = self
-                .sessions
-                .iter_mut()
-                .find(|session| pr_poll_key(session) == result.key)
-            {
-                let before = pr_render_signature(&session.pr);
-                session.pr = result.cache;
-                changed |= before != pr_render_signature(&session.pr);
+            match result {
+                PrPollResult::Summary { summaries } => {
+                    self.pr_summary_poll_in_flight = false;
+                    let before = self
+                        .sessions
+                        .iter()
+                        .map(|session| pr_render_signature(&session.pr))
+                        .collect::<Vec<_>>();
+                    match summaries {
+                        Ok(summaries) => {
+                            refresh_pr_summary_index(&self.repo, &mut self.sessions, summaries);
+                        }
+                        Err(error) => {
+                            for session in &mut self.sessions {
+                                session.pr.error = Some(error.clone());
+                            }
+                        }
+                    }
+                    let after = self
+                        .sessions
+                        .iter()
+                        .map(|session| pr_render_signature(&session.pr))
+                        .collect::<Vec<_>>();
+                    changed |= before != after;
+                }
+                PrPollResult::Details { key, cache } => {
+                    self.pr_polls_in_flight.remove(&key);
+                    if let Some(session) = self
+                        .sessions
+                        .iter_mut()
+                        .find(|session| pr_poll_key(session) == key)
+                    {
+                        let before = pr_render_signature(&session.pr);
+                        let current_pr = session.pr.summary.as_ref().map(|summary| summary.number);
+                        let result_pr = cache.summary.as_ref().map(|summary| summary.number);
+                        if current_pr == result_pr {
+                            session.pr.details = cache.details;
+                            session.pr.details_last_polled = cache.details_last_polled;
+                            session.pr.error = cache.error;
+                        }
+                        changed |= before != pr_render_signature(&session.pr);
+                    }
+                }
             }
         }
         changed

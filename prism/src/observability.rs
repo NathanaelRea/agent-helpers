@@ -886,6 +886,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
           head_sha text not null,
           updated_at text not null,
           check_status text not null,
+          comment_count integer not null default 0,
           merged integer not null,
           draft integer not null,
           last_refreshed text not null,
@@ -900,6 +901,13 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             [],
         )
         .map_err(|error| format!("migrate pr_cache body column: {error}"))?;
+    }
+    if !table_has_column(conn, "pr_cache", "comment_count")? {
+        conn.execute(
+            "alter table pr_cache add column comment_count integer not null default 0",
+            [],
+        )
+        .map_err(|error| format!("migrate pr_cache comment_count column: {error}"))?;
     }
     conn.pragma_update(None, "foreign_keys", true)
         .map_err(|error| format!("enable foreign keys: {error}"))?;

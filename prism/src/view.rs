@@ -341,10 +341,21 @@ fn pr_label(session: &Session) -> String {
 }
 
 fn comment_count_label(session: &Session) -> String {
-    let Some(details) = &session.pr.details else {
+    let count = session
+        .pr
+        .details
+        .as_ref()
+        .map(|details| details.comments.len() + details.review_comments.len())
+        .or_else(|| {
+            session
+                .pr
+                .summary
+                .as_ref()
+                .map(|summary| summary.comment_count as usize)
+        });
+    let Some(count) = count else {
         return "C?".to_string();
     };
-    let count = details.comments.len() + details.review_comments.len();
     format!("C{count}")
 }
 

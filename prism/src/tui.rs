@@ -7,7 +7,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::agent::AgentState;
 use crate::config::Config;
-use crate::github::PrCache;
+use crate::github::{PrCache, PrSummary};
 use crate::input::{Key, KeyInput};
 use crate::repo::Repository;
 use crate::session::{Session, append_runtime_log};
@@ -24,6 +24,8 @@ pub struct Tui {
     pub(crate) pr_poll_tx: Sender<PrPollResult>,
     pub(crate) pr_poll_rx: Receiver<PrPollResult>,
     pub(crate) pr_polls_in_flight: BTreeSet<PrPollKey>,
+    pub(crate) pr_summary_poll_in_flight: bool,
+    pub(crate) pr_summary_last_polled: Option<std::time::Instant>,
     pub(crate) tmux_warmup_tx: Sender<TmuxWarmupResult>,
     pub(crate) tmux_warmup_rx: Receiver<TmuxWarmupResult>,
     pub(crate) tmux_warmups_in_flight: BTreeSet<TmuxWarmupKey>,
@@ -37,9 +39,14 @@ pub(crate) struct PrPollKey {
     pub path: PathBuf,
 }
 
-pub(crate) struct PrPollResult {
-    pub key: PrPollKey,
-    pub cache: PrCache,
+pub(crate) enum PrPollResult {
+    Summary {
+        summaries: Result<Vec<PrSummary>, String>,
+    },
+    Details {
+        key: PrPollKey,
+        cache: PrCache,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -78,6 +85,8 @@ impl Tui {
             pr_poll_tx,
             pr_poll_rx,
             pr_polls_in_flight: BTreeSet::new(),
+            pr_summary_poll_in_flight: false,
+            pr_summary_last_polled: None,
             tmux_warmup_tx,
             tmux_warmup_rx,
             tmux_warmups_in_flight: BTreeSet::new(),

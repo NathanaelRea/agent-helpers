@@ -120,6 +120,46 @@ pub fn json_array_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
+pub fn json_object_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{key}\"");
+    let start = text.find(&needle)?;
+    let rest = &text[start + needle.len()..];
+    let colon = rest.find(':')?;
+    let value = rest[colon + 1..].trim_start();
+    if !value.starts_with('{') {
+        return None;
+    }
+    let mut depth = 0_i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string {
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&value[..=index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 pub fn json_objects_in_array<'a>(text: &'a str, key: &str) -> Vec<&'a str> {
     json_array_field(text, key)
         .map(json_top_level_objects)
@@ -211,5 +251,12 @@ mod tests {
         assert_eq!(json_u64_field(raw, "number"), Some(42));
         assert_eq!(json_bool_field(raw, "isDraft"), Some(true));
         assert_eq!(json_array_object_count(raw, "comments"), Some(1));
+    }
+
+    #[test]
+    fn json_object_field_reads_nested_object() {
+        let raw = r#"{"comments":{"totalCount":3},"other":true}"#;
+        let comments = json_object_field(raw, "comments").unwrap();
+        assert_eq!(json_u64_field(comments, "totalCount"), Some(3));
     }
 }
