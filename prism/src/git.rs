@@ -18,32 +18,42 @@ pub fn git_status_label(path: &std::path::Path, config: &Config) -> String {
 
 pub fn parse_git_status_label(output: &str) -> String {
     let mut branch = "";
-    let mut dirty = false;
+    let mut dirty_count = 0_usize;
     for line in output.lines() {
         if let Some(rest) = line.strip_prefix("## ") {
             branch = rest;
         } else if !line.trim().is_empty() {
-            dirty = true;
+            dirty_count += 1;
         }
     }
-    let relation = if branch.contains("ahead ") && branch.contains("behind ") {
-        "diverged"
-    } else if branch.contains("ahead ") {
-        "ahead"
-    } else if branch.contains("behind ") {
-        "behind"
-    } else {
-        "clean"
-    };
-    if dirty {
-        if relation == "clean" {
-            "dirty".to_string()
-        } else {
-            format!("dirty {relation}")
-        }
-    } else {
-        relation.to_string()
+    let ahead_count = parse_branch_count(branch, "ahead").unwrap_or(0);
+    let behind_count = parse_branch_count(branch, "behind").unwrap_or(0);
+
+    let mut parts = Vec::new();
+    if dirty_count > 0 {
+        parts.push(format!("dirty {dirty_count}"));
     }
+    if ahead_count > 0 {
+        parts.push(format!("ahead {ahead_count}"));
+    }
+    if behind_count > 0 {
+        parts.push(format!("behind {behind_count}"));
+    }
+    if parts.is_empty() {
+        "clean".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn parse_branch_count(branch: &str, key: &str) -> Option<usize> {
+    let start = branch.find(key)?;
+    let rest = branch[start + key.len()..].trim_start();
+    let digits = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
 }
 
 pub fn worktree_dirty(repo: &Repository, config: &Config) -> Result<bool, String> {
@@ -86,15 +96,17 @@ mod tests {
         assert_eq!(parse_git_status_label("## main...origin/main\n"), "clean");
         assert_eq!(
             parse_git_status_label("## main...origin/main [ahead 1]\n"),
-            "ahead"
+            "ahead 1"
         );
         assert_eq!(
             parse_git_status_label("## main...origin/main [behind 1]\n M src/main.rs\n"),
-            "dirty behind"
+            "dirty 1 behind 1"
         );
         assert_eq!(
-            parse_git_status_label("## main...origin/main [ahead 1, behind 1]\n"),
-            "diverged"
+            parse_git_status_label(
+                "## main...origin/main [ahead 3, behind 2]\n M src/main.rs\n?? new.rs\n"
+            ),
+            "dirty 2 ahead 3 behind 2"
         );
     }
 }

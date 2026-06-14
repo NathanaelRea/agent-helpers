@@ -307,8 +307,8 @@ fn format_session_row(session: &Session, selected: bool, width: usize) -> String
         marker,
         styled_cell(&session.branch, 22, branch_code),
         styled_cell(
-            &session.status_label,
-            7,
+            &git_status_indicator(&session.status_label),
+            3,
             git_status_color(&session.status_label)
         ),
         styled_cell(
@@ -384,6 +384,26 @@ fn agent_icon(state: AgentState) -> &'static str {
         AgentState::NeedsRestart => "↻",
         AgentState::NeedsInput => "!",
     }
+}
+
+fn git_status_indicator(status: &str) -> String {
+    let dirty = status.contains("dirty");
+    let diverged = status.contains("diverged");
+    let ahead = status.contains("ahead");
+    let behind = status.contains("behind");
+
+    let mut out = String::new();
+    if dirty {
+        out.push('✗');
+    }
+    if diverged {
+        out.push('↕');
+    } else if ahead {
+        out.push('↑');
+    } else if behind {
+        out.push('↓');
+    }
+    out
 }
 
 fn git_status_color(status: &str) -> &'static str {
@@ -735,7 +755,7 @@ mod tests {
     use crate::repo::Repository;
     use crate::session::Session;
 
-    use super::render_frame;
+    use super::{git_status_indicator, render_frame};
 
     #[test]
     fn render_frame_does_not_clear_the_whole_screen() {
@@ -822,5 +842,17 @@ mod tests {
         );
 
         assert!(frame.contains("status: current worktree is dirty"));
+    }
+
+    #[test]
+    fn git_status_indicator_uses_arrows() {
+        assert_eq!(git_status_indicator("clean"), "");
+        assert_eq!(git_status_indicator("dirty"), "✗");
+        assert_eq!(git_status_indicator("ahead"), "↑");
+        assert_eq!(git_status_indicator("behind"), "↓");
+        assert_eq!(git_status_indicator("diverged"), "↕");
+        assert_eq!(git_status_indicator("dirty ahead"), "✗↑");
+        assert_eq!(git_status_indicator("dirty behind"), "✗↓");
+        assert_eq!(git_status_indicator("dirty diverged"), "✗↕");
     }
 }
