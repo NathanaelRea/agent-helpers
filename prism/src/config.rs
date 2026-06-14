@@ -261,6 +261,7 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
         &config.tool(&config.worktree_command),
         true,
     );
+    print_tool_status("codex-plan", &config.tool("codex_plan"), false);
     println!();
 
     let detected = detected_agents(config);
@@ -321,6 +322,32 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+pub fn ensure_required_tools(config: &Config) -> Result<(), String> {
+    let required = [
+        ("git", config.tool("git")),
+        ("gh", config.tool("gh")),
+        (
+            config.worktree_command.as_str(),
+            config.tool(&config.worktree_command),
+        ),
+    ];
+    let missing = required
+        .into_iter()
+        .filter(|(_, command)| !command_exists(command))
+        .map(|(label, command)| format!("{label} ({command})"))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "missing required tool(s): {}. Install them or configure [tools] in {} or {}",
+            missing.join(", "),
+            config.user_path.display(),
+            config.repo_path.display()
+        ))
+    }
 }
 
 fn print_tool_status(label: &str, command: &str, required: bool) {

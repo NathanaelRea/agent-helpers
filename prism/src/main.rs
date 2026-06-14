@@ -11,6 +11,7 @@ mod process;
 mod repo;
 mod review;
 mod session;
+mod setup;
 mod terminal;
 mod tui;
 mod util;
@@ -40,7 +41,9 @@ fn run() -> Result<(), String> {
         CommandKind::Doctor => config::doctor(&repo, &mut config),
         CommandKind::RunPlan(path) => plan::run_plan_cli(&repo, &config, &path),
         CommandKind::Tui => {
+            config::ensure_required_tools(&config)?;
             config::ensure_default_agent(&mut config)?;
+            setup::maybe_prompt_startup_setup(&repo, &config)?;
             let sessions = session::discover_sessions(&repo, &config)?;
             tui::Tui::new(repo, config, sessions, args.allow_dirty).run()
         }
