@@ -74,10 +74,10 @@ fn prompt_setup_loop(
         println!();
         println!("Prism setup");
         println!();
-        if let (Some(current), Some(base)) = (&setup.current_branch, &setup.default_base) {
-            if current != base {
-                println!("You are on {current}, not {base}.");
-            }
+        if let (Some(current), Some(base)) = (&setup.current_branch, &setup.default_base)
+            && current != base
+        {
+            println!("You are on {current}, not {base}.");
         }
         if setup.no_extra_worktrees {
             println!("No additional worktree sessions are set up yet.");

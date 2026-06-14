@@ -133,12 +133,12 @@ impl Tui {
                 while session.agent_output.len() > 200 {
                     session.agent_output.pop_front();
                 }
-                if session.agent_state == AgentState::Running {
-                    if let Some(state) = agent.try_wait() {
-                        session.agent_state = state;
-                        let _ = save_agent_state(&self.repo, &session.branch, state);
-                        changed = true;
-                    }
+                if session.agent_state == AgentState::Running
+                    && let Some(state) = agent.try_wait()
+                {
+                    session.agent_state = state;
+                    let _ = save_agent_state(&self.repo, &session.branch, state);
+                    changed = true;
                 }
             }
         }
@@ -176,7 +176,10 @@ impl Tui {
                 self.pr_polls_in_flight.insert(key.clone());
                 std::thread::spawn(move || {
                     refresh_pr_details_cache(&branch, &mut cache, &path, &config);
-                    let _ = tx.send(PrPollResult::Details { key, cache });
+                    let _ = tx.send(PrPollResult::Details {
+                        key,
+                        cache: Box::new(cache),
+                    });
                 });
             }
         }

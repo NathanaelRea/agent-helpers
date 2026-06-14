@@ -45,7 +45,7 @@ pub(crate) enum PrPollResult {
     },
     Details {
         key: PrPollKey,
-        cache: PrCache,
+        cache: Box<PrCache>,
     },
 }
 

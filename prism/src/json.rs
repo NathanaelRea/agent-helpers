@@ -195,10 +195,10 @@ pub fn json_top_level_objects(text: &str) -> Vec<&str> {
             }
             '}' => {
                 depth -= 1;
-                if depth == 0 {
-                    if let Some(object_start) = start.take() {
-                        objects.push(&text[object_start..=index]);
-                    }
+                if depth == 0
+                    && let Some(object_start) = start.take()
+                {
+                    objects.push(&text[object_start..=index]);
                 }
             }
             _ => {}
@@ -222,10 +222,10 @@ pub fn collect_json_string_fields(text: &str, key: &str, limit: usize) -> Vec<St
             break;
         };
         let start = offset + relative;
-        if let Some(value) = json_string_field(&text[start..], key) {
-            if !value.trim().is_empty() {
-                values.push(value);
-            }
+        if let Some(value) = json_string_field(&text[start..], key)
+            && !value.trim().is_empty()
+        {
+            values.push(value);
         }
         offset = start + needle.len();
     }

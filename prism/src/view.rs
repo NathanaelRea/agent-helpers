@@ -32,6 +32,7 @@ pub fn draw(
     io::stdout().flush().map_err(|error| error.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_frame(
     repo: &Repository,
     config: &Config,
@@ -308,7 +309,7 @@ fn format_session_row(session: &Session, selected: bool, width: usize) -> String
         styled_cell(&session.branch, 22, branch_code),
         styled_cell(
             &git_status_indicator(&session.status_label),
-            3,
+            9,
             git_status_color(&session.status_label)
         ),
         styled_cell(
@@ -387,35 +388,42 @@ fn agent_icon(state: AgentState) -> &'static str {
 }
 
 fn git_status_indicator(status: &str) -> String {
-    let dirty = status.contains("dirty");
-    let diverged = status.contains("diverged");
-    let ahead = status.contains("ahead");
-    let behind = status.contains("behind");
-
     let mut out = String::new();
-    if dirty {
+    if let Some(count) = status_count(status, "dirty") {
         out.push('✗');
+        out.push_str(&count.to_string());
     }
-    if diverged {
-        out.push('↕');
-    } else if ahead {
+    if let Some(count) = status_count(status, "ahead") {
         out.push('↑');
-    } else if behind {
+        out.push_str(&count.to_string());
+    }
+    if let Some(count) = status_count(status, "behind") {
         out.push('↓');
+        out.push_str(&count.to_string());
     }
     out
 }
 
 fn git_status_color(status: &str) -> &'static str {
-    if status.contains("dirty") || status.contains("diverged") {
+    if status_count(status, "dirty").is_some() {
         "31"
-    } else if status.contains("behind") {
+    } else if status_count(status, "behind").is_some() {
         "33"
-    } else if status.contains("ahead") {
+    } else if status_count(status, "ahead").is_some() {
         "36"
     } else {
         "32"
     }
+}
+
+fn status_count(status: &str, key: &str) -> Option<usize> {
+    let mut words = status.split_whitespace();
+    while let Some(word) = words.next() {
+        if word == key {
+            return words.next()?.parse().ok();
+        }
+    }
+    None
 }
 
 fn agent_state_color(state: AgentState) -> &'static str {
@@ -847,12 +855,10 @@ mod tests {
     #[test]
     fn git_status_indicator_uses_arrows() {
         assert_eq!(git_status_indicator("clean"), "");
-        assert_eq!(git_status_indicator("dirty"), "✗");
-        assert_eq!(git_status_indicator("ahead"), "↑");
-        assert_eq!(git_status_indicator("behind"), "↓");
-        assert_eq!(git_status_indicator("diverged"), "↕");
-        assert_eq!(git_status_indicator("dirty ahead"), "✗↑");
-        assert_eq!(git_status_indicator("dirty behind"), "✗↓");
-        assert_eq!(git_status_indicator("dirty diverged"), "✗↕");
+        assert_eq!(git_status_indicator("dirty 1"), "✗1");
+        assert_eq!(git_status_indicator("ahead 3"), "↑3");
+        assert_eq!(git_status_indicator("behind 2"), "↓2");
+        assert_eq!(git_status_indicator("ahead 3 behind 2"), "↑3↓2");
+        assert_eq!(git_status_indicator("dirty 4 ahead 3 behind 2"), "✗4↑3↓2");
     }
 }

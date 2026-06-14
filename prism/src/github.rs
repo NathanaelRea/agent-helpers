@@ -6,7 +6,7 @@ use rusqlite::params;
 use crate::config::Config;
 use crate::json::{
     collect_json_string_fields, json_bool_field, json_login_field, json_object_field,
-    json_objects_in_array, json_string_field, json_top_level_objects, json_u64_field,
+    json_objects_in_array, json_string_field, json_u64_field,
 };
 use crate::observability;
 use crate::process::run_capture;
@@ -575,8 +575,9 @@ fn parse_pr_reviews(raw: &str) -> Vec<PrReview> {
         .collect()
 }
 
-pub fn parse_inline_review_comments(raw: &str) -> Vec<PrReviewComment> {
-    json_top_level_objects(raw)
+#[cfg(test)]
+fn parse_inline_review_comments(raw: &str) -> Vec<PrReviewComment> {
+    crate::json::json_top_level_objects(raw)
         .into_iter()
         .map(|object| PrReviewComment {
             author: json_login_field(object).unwrap_or_default(),

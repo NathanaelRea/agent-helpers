@@ -531,10 +531,10 @@ fn record_panic(message: String) {
         message: truncate(&single_line(&message), 500),
         data_json: None,
     };
-    if let Some(mutex) = OBSERVER.get() {
-        if let Ok(mut state) = mutex.try_lock() {
-            state.record_event(event);
-        }
+    if let Some(mutex) = OBSERVER.get()
+        && let Ok(mut state) = mutex.try_lock()
+    {
+        state.record_event(event);
     }
 }
 
@@ -1043,10 +1043,10 @@ fn sanitize_arg(arg: &str, redact: bool) -> String {
         if lower == *flag {
             return arg.to_string();
         }
-        if let Some((name, _)) = lower.split_once('=') {
-            if name == *flag {
-                return format!("{flag}=<redacted>");
-            }
+        if let Some((name, _)) = lower.split_once('=')
+            && name == *flag
+        {
+            return format!("{flag}=<redacted>");
         }
     }
     if lower.contains("token=")
