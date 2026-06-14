@@ -29,6 +29,7 @@ pub struct PrCache {
 pub struct PrSummary {
     pub number: u64,
     pub title: String,
+    pub body: String,
     pub url: String,
     pub state: String,
     pub review_decision: String,
@@ -44,10 +45,11 @@ pub struct PrSummary {
 impl PrSummary {
     pub fn signature(&self) -> String {
         format!(
-            "{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}",
             self.number,
             self.state,
             self.review_decision,
+            self.body,
             self.head_sha,
             self.updated_at,
             self.check_status
@@ -92,7 +94,7 @@ pub fn load_pr_cache(repo: &Repository, branch: &str) -> PrCache {
     let Ok((summary, last_refreshed)) = observability::with_writable_db(repo, |conn| {
         conn.query_row(
             "select
-                number, title, url, state, review_decision, head_ref, base_ref, head_sha,
+                number, title, body, url, state, review_decision, head_ref, base_ref, head_sha,
                 updated_at, check_status, merged, draft, last_refreshed
              from pr_cache
              where branch = ?1",
@@ -102,18 +104,19 @@ pub fn load_pr_cache(repo: &Repository, branch: &str) -> PrCache {
                     PrSummary {
                         number: row.get(0)?,
                         title: row.get(1)?,
-                        url: row.get(2)?,
-                        state: row.get(3)?,
-                        review_decision: row.get(4)?,
-                        head_ref: row.get(5)?,
-                        base_ref: row.get(6)?,
-                        head_sha: row.get(7)?,
-                        updated_at: row.get(8)?,
-                        check_status: row.get(9)?,
-                        merged: row.get(10)?,
-                        draft: row.get(11)?,
+                        body: row.get(2)?,
+                        url: row.get(3)?,
+                        state: row.get(4)?,
+                        review_decision: row.get(5)?,
+                        head_ref: row.get(6)?,
+                        base_ref: row.get(7)?,
+                        head_sha: row.get(8)?,
+                        updated_at: row.get(9)?,
+                        check_status: row.get(10)?,
+                        merged: row.get(11)?,
+                        draft: row.get(12)?,
                     },
-                    row.get::<_, String>(12)?,
+                    row.get::<_, String>(13)?,
                 ))
             },
         )
@@ -182,6 +185,7 @@ fn fetch_pr_summary(
     let fields = [
         "number",
         "title",
+        "body",
         "url",
         "state",
         "reviewDecision",
@@ -226,6 +230,7 @@ fn fetch_pr_summary(
     let summary = PrSummary {
         number,
         title: json_string_field(&raw, "title").unwrap_or_default(),
+        body: json_string_field(&raw, "body").unwrap_or_default(),
         url: json_string_field(&raw, "url").unwrap_or_default(),
         state: json_string_field(&raw, "state").unwrap_or_default(),
         review_decision: json_string_field(&raw, "reviewDecision")
@@ -431,13 +436,14 @@ fn save_pr_cache(repo: &Repository, branch: &str, cache: &PrCache) -> Result<(),
     observability::with_writable_db(repo, |conn| {
         conn.execute(
             "insert into pr_cache (
-                branch, number, title, url, state, review_decision, head_ref, base_ref,
+                branch, number, title, body, url, state, review_decision, head_ref, base_ref,
                 head_sha, updated_at, check_status, merged, draft, last_refreshed,
                 refreshed_unix_ms
-             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              on conflict(branch) do update set
                 number = excluded.number,
                 title = excluded.title,
+                body = excluded.body,
                 url = excluded.url,
                 state = excluded.state,
                 review_decision = excluded.review_decision,
@@ -454,6 +460,7 @@ fn save_pr_cache(repo: &Repository, branch: &str, cache: &PrCache) -> Result<(),
                 branch,
                 summary.number,
                 summary.title.as_str(),
+                summary.body.as_str(),
                 summary.url.as_str(),
                 summary.state.as_str(),
                 summary.review_decision.as_str(),

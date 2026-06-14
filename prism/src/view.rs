@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 
-use crate::agent::output_tail;
+use crate::agent::{AgentState, output_tail};
 use crate::config::Config;
 use crate::repo::Repository;
 use crate::session::Session;
@@ -42,24 +42,28 @@ pub(crate) fn render_frame(
     cols: u16,
     rows: u16,
 ) -> String {
-    let left_width = cols.clamp(36, 52);
-    let pr_width = if cols >= 110 { 34 } else { 0 };
-    let center_width = cols
-        .saturating_sub(left_width + pr_width + if pr_width > 0 { 2 } else { 1 })
-        .max(24);
+    let pr_width = if cols >= 118 { 36 } else { 0 };
+    let left_width = if pr_width > 0 {
+        cols.saturating_sub(pr_width + 26).clamp(42, 68)
+    } else {
+        cols.saturating_sub(25).clamp(36, 64)
+    };
+    let center_width =
+        cols.saturating_sub(left_width + pr_width + if pr_width > 0 { 2 } else { 1 });
     let mut frame = String::from("\x1b[?25l\x1b[H");
     if pr_width > 0 {
         push_line(
             &mut frame,
             cols,
             format!(
-                "{:<left_width$}| {:<center_width$}| {:<pr_width$}",
-                "Sessions / Worktrees",
-                "Agent Session",
-                "PR / Review Context",
-                left_width = left_width as usize,
-                center_width = center_width.saturating_sub(2) as usize,
-                pr_width = pr_width.saturating_sub(2) as usize
+                "{}| {}| {}",
+                styled_cell("Sessions / Worktrees", left_width as usize, "1;36"),
+                styled_cell(
+                    "Agent Session",
+                    center_width.saturating_sub(2) as usize,
+                    "1;36"
+                ),
+                styled_cell("PR", pr_width.saturating_sub(2) as usize, "1;36"),
             ),
         );
         push_line(
@@ -77,11 +81,13 @@ pub(crate) fn render_frame(
             &mut frame,
             cols,
             format!(
-                "{:<left_width$}| {:<center_width$}",
-                "Sessions / Worktrees",
-                "Agent / PR",
-                left_width = left_width as usize,
-                center_width = center_width.saturating_sub(2) as usize
+                "{}| {}",
+                styled_cell("Sessions / Worktrees", left_width as usize, "1;36"),
+                styled_cell(
+                    "Agent / PR",
+                    center_width.saturating_sub(2) as usize,
+                    "1;36"
+                ),
             ),
         );
         push_line(
@@ -117,7 +123,10 @@ pub(crate) fn render_frame(
         } else if row == 0 {
             format!(
                 "default agent: {}",
-                truncate_line(&config.default_agent, center_width as usize - 2)
+                truncate_line(
+                    &config.default_agent,
+                    center_width.saturating_sub(2) as usize
+                )
             )
         } else {
             String::new()
@@ -128,11 +137,9 @@ pub(crate) fn render_frame(
                 &mut frame,
                 cols,
                 format!(
-                    "{left}| {:<center_width$}| {:<pr_width$}",
-                    truncate_line(&center, center_width.saturating_sub(2) as usize),
-                    truncate_line(&pr, pr_width.saturating_sub(2) as usize),
-                    center_width = center_width.saturating_sub(2) as usize,
-                    pr_width = pr_width.saturating_sub(2) as usize
+                    "{left}| {}| {}",
+                    ansi_cell(&center, center_width.saturating_sub(2) as usize),
+                    ansi_cell(&pr, pr_width.saturating_sub(2) as usize),
                 ),
             );
         } else {
@@ -148,9 +155,8 @@ pub(crate) fn render_frame(
                 &mut frame,
                 cols,
                 format!(
-                    "{left}| {:<center_width$}",
-                    truncate_line(&merged, center_width.saturating_sub(2) as usize),
-                    center_width = center_width.saturating_sub(2) as usize
+                    "{left}| {}",
+                    ansi_cell(&merged, center_width.saturating_sub(2) as usize),
                 ),
             );
         }
@@ -194,35 +200,244 @@ fn push_line(frame: &mut String, cols: u16, line: String) {
 }
 
 fn fit_line(line: &str, cols: usize) -> String {
-    let mut line = truncate_line(line, cols);
-    let len = line.chars().count();
+    let mut line = truncate_ansi_line(line, cols);
+    let len = visible_len(&line);
     if len < cols {
         line.push_str(&" ".repeat(cols - len));
     }
     line
 }
 
+fn visible_len(line: &str) -> usize {
+    let mut len = 0;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for seq_ch in chars.by_ref() {
+                if seq_ch.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            len += 1;
+        }
+    }
+    len
+}
+
+fn truncate_ansi_line(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if visible_len(text) <= max_chars {
+        return text.to_string();
+    }
+    if max_chars == 1 {
+        return "~".to_string();
+    }
+
+    let mut out = String::new();
+    let mut visible = 0;
+    let mut saw_style = false;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            saw_style = true;
+            out.push(ch);
+            out.push(chars.next().unwrap());
+            for seq_ch in chars.by_ref() {
+                out.push(seq_ch);
+                if seq_ch.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        if visible + 1 >= max_chars {
+            out.push('~');
+            if saw_style {
+                out.push_str("\x1b[0m");
+            }
+            return out;
+        }
+        out.push(if ch.is_ascii_control() { ' ' } else { ch });
+        visible += 1;
+    }
+    out
+}
+
+fn color(text: &str, code: &str) -> String {
+    format!("\x1b[{code}m{text}\x1b[0m")
+}
+
+fn plain_cell(text: &str, width: usize) -> String {
+    format!("{:<width$}", truncate_line(text, width), width = width)
+}
+
+fn styled_cell(text: &str, width: usize, code: &str) -> String {
+    color(&plain_cell(text, width), code)
+}
+
+fn ansi_cell(text: &str, width: usize) -> String {
+    let mut text = truncate_ansi_line(text, width);
+    let len = visible_len(&text);
+    if len < width {
+        text.push_str(&" ".repeat(width - len));
+    }
+    text
+}
+
 fn format_session_row(session: &Session, selected: bool, width: usize) -> String {
-    let marker = if selected { ">" } else { " " };
-    let adopted = if session.adopted {
-        "tracked"
-    } else {
-        "untracked"
-    };
     let summary = if session.prompt_summary.is_empty() {
         "-"
     } else {
         &session.prompt_summary
     };
+    let marker = if selected {
+        color("▶", "1;36")
+    } else {
+        " ".to_string()
+    };
+    let branch_code = if selected { "1;37" } else { "37" };
+    let pr = pr_label(session);
+    let comments = comment_count_label(session);
     let text = format!(
-        "{marker} {:22} {:13} {:13} {:9} {}",
-        truncate_line(&session.branch, 22),
-        session.status_label,
-        session.agent_state.label(),
-        adopted,
-        truncate_line(summary, 50)
+        "{} {} {} {} {} {} {} {}",
+        marker,
+        styled_cell(&session.branch, 22, branch_code),
+        styled_cell(
+            &session.status_label,
+            7,
+            git_status_color(&session.status_label)
+        ),
+        styled_cell(
+            agent_icon(session.agent_state),
+            3,
+            agent_state_color(session.agent_state)
+        ),
+        styled_cell(&pr, 7, pr_color(session)),
+        styled_cell(ci_icon(session), 3, ci_color(session)),
+        styled_cell(&comments, 4, comment_color(session)),
+        truncate_line(summary, 50),
     );
-    format!("{:<width$}", truncate_line(&text, width), width = width)
+    ansi_cell(&text, width)
+}
+
+fn pr_label(session: &Session) -> String {
+    let Some(summary) = &session.pr.summary else {
+        return "no-pr".to_string();
+    };
+    let icon = if summary.merged {
+        "◆"
+    } else if summary.draft {
+        "◌"
+    } else if summary.state == "OPEN" {
+        "●"
+    } else {
+        "×"
+    };
+    format!("{icon}#{}", summary.number)
+}
+
+fn comment_count_label(session: &Session) -> String {
+    let Some(details) = &session.pr.details else {
+        return "C?".to_string();
+    };
+    let count = details.comments.len() + details.review_comments.len();
+    format!("C{count}")
+}
+
+fn ci_icon(session: &Session) -> &'static str {
+    match session
+        .pr
+        .summary
+        .as_ref()
+        .map(|summary| summary.check_status.as_str())
+    {
+        Some("passed") => "✓",
+        Some("failed") => "✕",
+        Some("running") => "…",
+        Some("mixed") => "±",
+        Some("unknown") | None => "?",
+        Some(_) => "!",
+    }
+}
+
+fn agent_icon(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Idle => "○",
+        AgentState::Running => "●",
+        AgentState::ExitedOk => "✓",
+        AgentState::ExitedError => "✕",
+        AgentState::NeedsRestart => "↻",
+        AgentState::NeedsInput => "!",
+    }
+}
+
+fn git_status_color(status: &str) -> &'static str {
+    if status.contains("dirty") || status.contains("diverged") {
+        "31"
+    } else if status.contains("behind") {
+        "33"
+    } else if status.contains("ahead") {
+        "36"
+    } else {
+        "32"
+    }
+}
+
+fn agent_state_color(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Idle => "90",
+        AgentState::Running => "33",
+        AgentState::ExitedOk => "32",
+        AgentState::ExitedError => "31",
+        AgentState::NeedsRestart => "35",
+        AgentState::NeedsInput => "35",
+    }
+}
+
+fn pr_color(session: &Session) -> &'static str {
+    let Some(summary) = &session.pr.summary else {
+        return "90";
+    };
+    if summary.merged {
+        "35"
+    } else if summary.draft {
+        "90"
+    } else if summary.state == "OPEN" {
+        "32"
+    } else {
+        "31"
+    }
+}
+
+fn ci_color(session: &Session) -> &'static str {
+    match session
+        .pr
+        .summary
+        .as_ref()
+        .map(|summary| summary.check_status.as_str())
+    {
+        Some("passed") => "32",
+        Some("failed") => "31",
+        Some("running") => "33",
+        Some("mixed") => "35",
+        Some("unknown") | None => "90",
+        Some(_) => "33",
+    }
+}
+
+fn comment_color(session: &Session) -> &'static str {
+    let Some(details) = &session.pr.details else {
+        return "90";
+    };
+    if details.comments.is_empty() && details.review_comments.is_empty() {
+        "90"
+    } else {
+        "36"
+    }
 }
 
 fn format_agent_panel_lines(session: Option<&Session>, mode_label: &str) -> Vec<String> {
@@ -251,13 +466,13 @@ fn format_agent_panel_lines(session: Option<&Session>, mode_label: &str) -> Vec<
 
 fn format_pr_panel_lines(session: Option<&Session>) -> Vec<String> {
     let Some(session) = session else {
-        return vec!["No selected worktree".to_string()];
+        return vec![color("No selected worktree", "90")];
     };
     if let Some(error) = &session.pr.error {
         return vec![
-            "PR refresh error".to_string(),
+            color("✕ PR refresh error", "1;31"),
             truncate_line(error, 120),
-            "Press r to retry".to_string(),
+            color("Press r to retry", "33"),
         ];
     }
     let Some(summary) = &session.pr.summary else {
@@ -267,75 +482,235 @@ fn format_pr_panel_lines(session: Option<&Session>) -> Vec<String> {
             .as_deref()
             .unwrap_or("not refreshed");
         return vec![
-            "No PR detected".to_string(),
-            format!("branch: {}", session.branch),
-            format!("last: {refreshed}"),
-            "P creates one explicitly".to_string(),
+            color("○ No PR detected", "90"),
+            format!("branch {}", truncate_line(&session.branch, 80)),
+            format!("last {refreshed}"),
+            color("P creates one explicitly", "33"),
         ];
     };
-    let mut lines = vec![
-        format!("PR #{} {}", summary.number, summary.state),
-        truncate_line(&summary.title, 80),
-        format!("{} -> {}", summary.head_ref, summary.base_ref),
-        format!("review: {}", summary.review_decision),
-        format!("checks: {}", summary.check_status),
-    ];
-    if let Some(details) = &session.pr.details {
-        lines.push(format!(
-            "comments: {}  reviews: {}",
-            details.comments.len(),
-            details.reviews.len()
-        ));
-        lines.push(format!(
-            "inline comments: {}",
-            details.review_comments.len()
-        ));
-        lines.push(format!("files: {}", details.files.len()));
+    let state = if summary.merged {
+        "merged"
+    } else if summary.draft {
+        "draft"
     } else {
-        lines.push("details: cached/pending".to_string());
-    }
-    if summary.draft {
-        lines.push("draft".to_string());
-    }
-    if summary.merged {
-        lines.push("merged".to_string());
+        summary.state.as_str()
+    };
+    let mut lines = vec![
+        color(
+            &format!(
+                "{} PR #{} {}",
+                pr_state_icon(summary),
+                summary.number,
+                state
+            ),
+            pr_state_color(summary),
+        ),
+        color(&truncate_line(&summary.title, 80), "1;37"),
+        format!(
+            "{} {}   {} {}",
+            color("base", "90"),
+            truncate_line(&summary.base_ref, 22),
+            color("head", "90"),
+            truncate_line(&summary.head_ref, 22),
+        ),
+        format!(
+            "{} {}   {} {} {}",
+            color("review", "90"),
+            color(
+                review_label(&summary.review_decision),
+                review_color(&summary.review_decision)
+            ),
+            color("ci", "90"),
+            color(ci_icon(session), ci_color(session)),
+            summary.check_status,
+        ),
+        String::new(),
+        color("Description", "1;36"),
+    ];
+    lines.extend(description_lines(&summary.body, 4));
+    if let Some(details) = &session.pr.details {
+        lines.push(String::new());
+        lines.push(color("Activity", "1;36"));
+        lines.push(format!(
+            "{} {}   {} {}   {} {}",
+            color("comments", "90"),
+            details.comments.len() + details.review_comments.len(),
+            color("reviews", "90"),
+            details.reviews.len(),
+            color("files", "90"),
+            details.files.len(),
+        ));
+        lines.extend(pr_comment_lines(details, 5));
+        if !details.failing_checks.is_empty() {
+            lines.push(color("Failing checks", "1;31"));
+            for check in details.failing_checks.iter().take(3) {
+                lines.push(format!("{} {}", color("✕", "31"), truncate_line(check, 80)));
+            }
+        }
+    } else {
+        lines.push(String::new());
+        lines.push(color("Activity pending", "90"));
     }
     if let Some(refreshed) = &session.pr.last_refreshed {
-        lines.push(format!("last refreshed: {refreshed}"));
-    }
-    if let Some(details) = &session.pr.details {
-        if !details.failing_checks.is_empty() {
-            lines.push("failing checks:".to_string());
-            for check in &details.failing_checks {
-                lines.push(format!("  {check}"));
-            }
-        }
-        if !details.files.is_empty() {
-            lines.push("changed files:".to_string());
-            for file in details.files.iter().take(4) {
-                lines.push(format!("  {file}"));
-            }
-        }
-        if !details.comments.is_empty() {
-            lines.push(format!(
-                "comment: {}",
-                truncate_line(&details.comments[0].body, 80)
-            ));
-        }
-        if !details.reviews.is_empty() {
-            lines.push(format!("latest review: {}", details.reviews[0].state));
-        }
-        if !details.review_comments.is_empty() {
-            lines.push(format!(
-                "inline: {}",
-                truncate_line(&details.review_comments[0].body, 80)
-            ));
-        }
-    }
-    if !summary.url.is_empty() {
-        lines.push(summary.url.clone());
+        lines.push(String::new());
+        lines.push(color(&format!("refreshed {refreshed}"), "90"));
     }
     lines
+}
+
+fn pr_comment_lines(details: &crate::github::PrDetails, max_comments: usize) -> Vec<String> {
+    let mut lines = vec![String::new(), color("Comments", "1;36")];
+    let mut shown = 0;
+
+    for comment in details.comments.iter().rev() {
+        if shown >= max_comments {
+            break;
+        }
+        append_comment(&mut lines, &comment.author, "", &comment.body);
+        shown += 1;
+    }
+
+    for review in details
+        .reviews
+        .iter()
+        .rev()
+        .filter(|review| !review.body.trim().is_empty())
+    {
+        if shown >= max_comments {
+            break;
+        }
+        append_comment(
+            &mut lines,
+            &review.author,
+            review_label(&review.state),
+            &review.body,
+        );
+        shown += 1;
+    }
+
+    for comment in details.review_comments.iter().rev() {
+        if shown >= max_comments {
+            break;
+        }
+        let context = if comment.line.is_empty() {
+            comment.path.clone()
+        } else {
+            format!("{}:{}", comment.path, comment.line)
+        };
+        append_comment(&mut lines, &comment.author, &context, &comment.body);
+        shown += 1;
+    }
+
+    if shown == 0 {
+        lines.push(color("No comments", "90"));
+    }
+
+    let total = details.comments.len()
+        + details.review_comments.len()
+        + details
+            .reviews
+            .iter()
+            .filter(|review| !review.body.trim().is_empty())
+            .count();
+    if total > shown {
+        lines.push(color(&format!("+{} more", total - shown), "90"));
+    }
+
+    lines
+}
+
+fn append_comment(lines: &mut Vec<String>, author: &str, context: &str, body: &str) {
+    let author = if author.trim().is_empty() {
+        "unknown"
+    } else {
+        author.trim()
+    };
+    let context = context.trim();
+    if context.is_empty() {
+        lines.push(format!(
+            "{} {}",
+            color("@", "90"),
+            truncate_line(author, 24)
+        ));
+    } else {
+        lines.push(format!(
+            "{} {} {}",
+            color("@", "90"),
+            truncate_line(author, 18),
+            color(&truncate_line(context, 28), "90"),
+        ));
+    }
+    let mut body_lines = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(2)
+        .peekable();
+    if body_lines.peek().is_none() {
+        lines.push(color("  empty comment", "90"));
+        return;
+    }
+    for line in body_lines {
+        lines.push(format!("  {}", truncate_line(line, 90)));
+    }
+}
+
+fn description_lines(body: &str, max_lines: usize) -> Vec<String> {
+    let lines = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(max_lines)
+        .map(|line| truncate_line(line, 90))
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        vec![color("No description", "90")]
+    } else {
+        lines
+    }
+}
+
+fn pr_state_icon(summary: &crate::github::PrSummary) -> &'static str {
+    if summary.merged {
+        "◆"
+    } else if summary.draft {
+        "◌"
+    } else if summary.state == "OPEN" {
+        "●"
+    } else {
+        "×"
+    }
+}
+
+fn pr_state_color(summary: &crate::github::PrSummary) -> &'static str {
+    if summary.merged {
+        "1;35"
+    } else if summary.draft {
+        "1;90"
+    } else if summary.state == "OPEN" {
+        "1;32"
+    } else {
+        "1;31"
+    }
+}
+
+fn review_label(decision: &str) -> &str {
+    match decision {
+        "APPROVED" => "approved",
+        "CHANGES_REQUESTED" => "changes",
+        "REVIEW_REQUIRED" => "needed",
+        "" | "UNKNOWN" => "unknown",
+        _ => decision,
+    }
+}
+
+fn review_color(decision: &str) -> &'static str {
+    match decision {
+        "APPROVED" => "32",
+        "CHANGES_REQUESTED" => "31",
+        "REVIEW_REQUIRED" => "33",
+        _ => "90",
+    }
 }
 
 #[cfg(test)]

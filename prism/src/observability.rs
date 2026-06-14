@@ -877,6 +877,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
           branch text primary key,
           number integer not null,
           title text not null,
+          body text not null default '',
           url text not null,
           state text not null,
           review_decision text not null,
@@ -893,9 +894,37 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         ",
     )
     .map_err(|error| format!("create schema: {error}"))?;
+    if !table_has_column(conn, "pr_cache", "body")? {
+        conn.execute(
+            "alter table pr_cache add column body text not null default ''",
+            [],
+        )
+        .map_err(|error| format!("migrate pr_cache body column: {error}"))?;
+    }
     conn.pragma_update(None, "foreign_keys", true)
         .map_err(|error| format!("enable foreign keys: {error}"))?;
     Ok(())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    let mut statement = conn
+        .prepare(&format!("pragma table_info({table})"))
+        .map_err(|error| format!("prepare table info: {error}"))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|error| format!("read table info: {error}"))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| format!("read column info: {error}"))?
+    {
+        let name = row
+            .get::<_, String>(1)
+            .map_err(|error| format!("read column name: {error}"))?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn append_text_line(path: &Path, line: &str) -> Result<(), String> {
