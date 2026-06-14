@@ -5,6 +5,7 @@ A small collection of tools and skills for working with coding agents.
 ## Tools
 
 - [`codex-plan`](./codex-plan/README.md) — run a phased markdown plan through `codex exec` one step at a time, with a split TUI for prompt history and current output.
+- [`prism`](./prism/README.md) - early Rust TUI harness for discovering agent worktree sessions and checking local workflow prerequisites.
 
 ## Skills
 
