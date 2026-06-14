@@ -1,4 +1,6 @@
+use std::env;
 use std::io::{self, ErrorKind, Read, Write};
+use std::process::Command;
 
 use crate::agent::AgentState;
 use crate::config::Config;
@@ -102,6 +104,22 @@ impl Tui {
                     Key::AgentMode => {
                         pending_g = false;
                         self.enter_agent_mode(&mut raw)?;
+                    }
+                    Key::LazyGit => {
+                        pending_g = false;
+                        if let Err(error) = self.open_lazygit(&mut raw) {
+                            self.show_error("lazygit failed", &error)?;
+                        }
+                    }
+                    Key::Terminal => {
+                        pending_g = false;
+                        if let Err(error) = self.open_terminal(&mut raw) {
+                            self.show_error("terminal failed", &error)?;
+                        }
+                    }
+                    Key::Help => {
+                        pending_g = false;
+                        self.show_keybindings_dialog()?;
                     }
                     Key::Refresh => {
                         pending_g = false;
@@ -216,6 +234,121 @@ impl Tui {
             self.show_error("agent terminal failed", &error)?;
         }
         Ok(())
+    }
+
+    fn open_lazygit(&mut self, raw: &mut RawTerminal) -> Result<(), String> {
+        let program = self.config.tool("lazygit");
+        self.run_in_selected_worktree(raw, program, &[])
+    }
+
+    fn open_terminal(&mut self, raw: &mut RawTerminal) -> Result<(), String> {
+        let shell = env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+        self.run_in_selected_worktree(raw, shell, &[])
+    }
+
+    fn run_in_selected_worktree(
+        &mut self,
+        raw: &mut RawTerminal,
+        program: String,
+        args: &[&str],
+    ) -> Result<(), String> {
+        if self.selected >= self.sessions.len() {
+            return Ok(());
+        }
+        let path = self.sessions[self.selected].path.clone();
+        raw.suspend()?;
+        let result = Command::new(&program)
+            .args(args)
+            .current_dir(&path)
+            .status()
+            .map_err(|error| format!("run {program}: {error}"))
+            .and_then(|status| {
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("{program} exited with {status}"))
+                }
+            });
+        let resume_result = raw.resume();
+        self.refresh_sessions()?;
+        self.refresh_tmux_agent_states();
+        resume_result?;
+        result
+    }
+
+    fn show_keybindings_dialog(&self) -> Result<(), String> {
+        let lines = [
+            "Keybindings",
+            "",
+            "Enter        open selected agent",
+            "Space g g    open lazygit in selected worktree",
+            "Ctrl-/       open shell in selected worktree",
+            "c            create worktree session",
+            "n            create plan",
+            "x            run plan",
+            "P            create or show PR",
+            "R            write review packet",
+            "f            start review-fix agent",
+            "m            commit review fix",
+            "u            push selected branch",
+            "a            remove from board",
+            "D            delete worktree",
+            "j/k, arrows   move selection",
+            "g g / G      top / bottom",
+            "r            refresh",
+            "q            quit",
+            "",
+            "Press any key to close",
+        ];
+        let (cols, rows) = terminal_size();
+        let available_width = (cols as usize).saturating_sub(2).max(4);
+        let width = lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0)
+            .saturating_add(4)
+            .max(24)
+            .min(available_width);
+        let height = lines.len() + 2;
+        let left = ((cols as usize).saturating_sub(width) / 2).saturating_add(1);
+        let top = ((rows as usize).saturating_sub(height) / 2).saturating_add(1);
+
+        print!("\x1b[?25l");
+        print!(
+            "\x1b[{top};{left}H+{}+",
+            "-".repeat(width.saturating_sub(2))
+        );
+        for (index, line) in lines.iter().enumerate() {
+            let y = top + index + 1;
+            let text_width = width.saturating_sub(4);
+            let text = truncate_line(line, text_width);
+            print!(
+                "\x1b[{y};{left}H| {:<text_width$} |",
+                text,
+                text_width = text_width
+            );
+        }
+        print!(
+            "\x1b[{};{}H+{}+",
+            top + height - 1,
+            left,
+            "-".repeat(width.saturating_sub(2))
+        );
+        io::stdout().flush().map_err(|error| error.to_string())?;
+
+        let mut stdin = io::stdin();
+        let mut byte = [0_u8; 1];
+        loop {
+            match stdin.read(&mut byte) {
+                Ok(1) => return Ok(()),
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
     }
 
     pub(crate) fn prompt_line(&self, prompt: &str) -> Result<String, String> {

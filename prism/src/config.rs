@@ -83,6 +83,7 @@ impl Config {
             ("gh", "gh"),
             ("git", "git"),
             ("tmux", "tmux"),
+            ("lazygit", "lazygit"),
             ("codex", "codex"),
             ("pi", "pi"),
             ("claude", "claude"),

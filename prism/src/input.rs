@@ -9,6 +9,8 @@ enum KeyInputState {
     Normal,
     Escape,
     Csi,
+    Leader,
+    LeaderG,
 }
 
 impl KeyInput {
@@ -18,7 +20,9 @@ impl KeyInput {
             match self.state {
                 KeyInputState::Normal => match byte {
                     b'\x1b' => self.state = KeyInputState::Escape,
-                    b'\r' | b'\n' | b'i' => keys.push(Key::AgentMode),
+                    b' ' => self.state = KeyInputState::Leader,
+                    b'\r' | b'\n' => keys.push(Key::AgentMode),
+                    31 => keys.push(Key::Terminal),
                     b'q' => keys.push(Key::Quit),
                     b'k' => keys.push(Key::Up),
                     b'j' => keys.push(Key::Down),
@@ -35,6 +39,7 @@ impl KeyInput {
                     b'c' => keys.push(Key::Create),
                     b'a' => keys.push(Key::Remove),
                     b'D' => keys.push(Key::Delete),
+                    b'?' => keys.push(Key::Help),
                     _ => keys.push(Key::Other),
                 },
                 KeyInputState::Escape => {
@@ -53,6 +58,20 @@ impl KeyInput {
                         _ => keys.push(Key::Other),
                     }
                 }
+                KeyInputState::Leader => match byte {
+                    b'g' => self.state = KeyInputState::LeaderG,
+                    _ => {
+                        self.state = KeyInputState::Normal;
+                        keys.push(Key::Other);
+                    }
+                },
+                KeyInputState::LeaderG => {
+                    self.state = KeyInputState::Normal;
+                    match byte {
+                        b'g' => keys.push(Key::LazyGit),
+                        _ => keys.push(Key::Other),
+                    }
+                }
             }
         }
         keys
@@ -65,6 +84,9 @@ pub enum Key {
     Bottom,
     G,
     AgentMode,
+    LazyGit,
+    Terminal,
+    Help,
     Refresh,
     PullRequest,
     ReviewPacket,
@@ -95,7 +117,21 @@ mod tests {
     fn key_input_handles_agent_mode_keys() {
         let mut input = KeyInput::default();
         let keys = input.feed(b"i\n");
-        assert!(matches!(keys.as_slice(), [Key::AgentMode, Key::AgentMode]));
+        assert!(matches!(keys.as_slice(), [Key::Other, Key::AgentMode]));
+    }
+
+    #[test]
+    fn key_input_handles_leader_lazygit() {
+        let mut input = KeyInput::default();
+        let keys = input.feed(b" gg");
+        assert!(matches!(keys.as_slice(), [Key::LazyGit]));
+    }
+
+    #[test]
+    fn key_input_handles_terminal_and_help_keys() {
+        let mut input = KeyInput::default();
+        let keys = input.feed(&[31, b'?']);
+        assert!(matches!(keys.as_slice(), [Key::Terminal, Key::Help]));
     }
 
     #[test]
