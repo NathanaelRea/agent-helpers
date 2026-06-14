@@ -15,40 +15,72 @@ pub fn draw(
     mode_label: &str,
 ) -> Result<(), String> {
     let (cols, rows) = terminal_size();
+    print!(
+        "{}",
+        render_frame(repo, config, sessions, selected, mode_label, cols, rows)
+    );
+    io::stdout().flush().map_err(|error| error.to_string())
+}
+
+pub(crate) fn render_frame(
+    repo: &Repository,
+    config: &Config,
+    sessions: &[Session],
+    selected: usize,
+    mode_label: &str,
+    cols: u16,
+    rows: u16,
+) -> String {
     let left_width = cols.clamp(36, 52);
     let pr_width = if cols >= 110 { 34 } else { 0 };
     let center_width = cols
         .saturating_sub(left_width + pr_width + if pr_width > 0 { 2 } else { 1 })
         .max(24);
-    print!("\x1b[?25l\x1b[H\x1b[2J");
+    let mut frame = String::from("\x1b[?25l\x1b[H");
     if pr_width > 0 {
-        println!(
-            "{:<left_width$}| {:<center_width$}| {:<pr_width$}",
-            "Sessions / Worktrees",
-            "Agent Session",
-            "PR / Review Context",
-            left_width = left_width as usize,
-            center_width = center_width.saturating_sub(2) as usize,
-            pr_width = pr_width.saturating_sub(2) as usize
+        push_line(
+            &mut frame,
+            cols,
+            format!(
+                "{:<left_width$}| {:<center_width$}| {:<pr_width$}",
+                "Sessions / Worktrees",
+                "Agent Session",
+                "PR / Review Context",
+                left_width = left_width as usize,
+                center_width = center_width.saturating_sub(2) as usize,
+                pr_width = pr_width.saturating_sub(2) as usize
+            ),
         );
-        println!(
-            "{}+{}+{}",
-            "-".repeat(left_width as usize),
-            "-".repeat(center_width as usize),
-            "-".repeat(pr_width as usize)
+        push_line(
+            &mut frame,
+            cols,
+            format!(
+                "{}+{}+{}",
+                "-".repeat(left_width as usize),
+                "-".repeat(center_width as usize),
+                "-".repeat(pr_width as usize)
+            ),
         );
     } else {
-        println!(
-            "{:<left_width$}| {:<center_width$}",
-            "Sessions / Worktrees",
-            "Agent / PR",
-            left_width = left_width as usize,
-            center_width = center_width.saturating_sub(2) as usize
+        push_line(
+            &mut frame,
+            cols,
+            format!(
+                "{:<left_width$}| {:<center_width$}",
+                "Sessions / Worktrees",
+                "Agent / PR",
+                left_width = left_width as usize,
+                center_width = center_width.saturating_sub(2) as usize
+            ),
         );
-        println!(
-            "{}+{}",
-            "-".repeat(left_width as usize),
-            "-".repeat(center_width as usize)
+        push_line(
+            &mut frame,
+            cols,
+            format!(
+                "{}+{}",
+                "-".repeat(left_width as usize),
+                "-".repeat(center_width as usize)
+            ),
         );
     }
 
@@ -81,12 +113,16 @@ pub fn draw(
         };
         if pr_width > 0 {
             let pr = pr_lines.get(row).cloned().unwrap_or_default();
-            println!(
-                "{left}| {:<center_width$}| {:<pr_width$}",
-                truncate_line(&center, center_width.saturating_sub(2) as usize),
-                truncate_line(&pr, pr_width.saturating_sub(2) as usize),
-                center_width = center_width.saturating_sub(2) as usize,
-                pr_width = pr_width.saturating_sub(2) as usize
+            push_line(
+                &mut frame,
+                cols,
+                format!(
+                    "{left}| {:<center_width$}| {:<pr_width$}",
+                    truncate_line(&center, center_width.saturating_sub(2) as usize),
+                    truncate_line(&pr, pr_width.saturating_sub(2) as usize),
+                    center_width = center_width.saturating_sub(2) as usize,
+                    pr_width = pr_width.saturating_sub(2) as usize
+                ),
             );
         } else {
             let merged = if row < agent_lines.len() {
@@ -97,10 +133,14 @@ pub fn draw(
                     .cloned()
                     .unwrap_or_default()
             };
-            println!(
-                "{left}| {:<center_width$}",
-                truncate_line(&merged, center_width.saturating_sub(2) as usize),
-                center_width = center_width.saturating_sub(2) as usize
+            push_line(
+                &mut frame,
+                cols,
+                format!(
+                    "{left}| {:<center_width$}",
+                    truncate_line(&merged, center_width.saturating_sub(2) as usize),
+                    center_width = center_width.saturating_sub(2) as usize
+                ),
             );
         }
     }
@@ -110,21 +150,43 @@ pub fn draw(
         repo.root.display()
     );
     if pr_width > 0 {
-        println!(
-            "{}+{}+{}",
-            "-".repeat(left_width as usize),
-            "-".repeat(center_width as usize),
-            "-".repeat(pr_width as usize)
+        push_line(
+            &mut frame,
+            cols,
+            format!(
+                "{}+{}+{}",
+                "-".repeat(left_width as usize),
+                "-".repeat(center_width as usize),
+                "-".repeat(pr_width as usize)
+            ),
         );
     } else {
-        println!(
-            "{}+{}",
-            "-".repeat(left_width as usize),
-            "-".repeat(center_width as usize)
+        push_line(
+            &mut frame,
+            cols,
+            format!(
+                "{}+{}",
+                "-".repeat(left_width as usize),
+                "-".repeat(center_width as usize)
+            ),
         );
     }
-    print!("{}", truncate_line(&footer, cols as usize));
-    io::stdout().flush().map_err(|error| error.to_string())
+    frame.push_str(&fit_line(&footer, cols as usize));
+    frame
+}
+
+fn push_line(frame: &mut String, cols: u16, line: String) {
+    frame.push_str(&fit_line(&line, cols as usize));
+    frame.push('\n');
+}
+
+fn fit_line(line: &str, cols: usize) -> String {
+    let mut line = truncate_line(line, cols);
+    let len = line.chars().count();
+    if len < cols {
+        line.push_str(&" ".repeat(cols - len));
+    }
+    line
 }
 
 fn format_session_row(session: &Session, selected: bool, width: usize) -> String {
@@ -261,4 +323,58 @@ fn format_pr_panel_lines(session: Option<&Session>) -> Vec<String> {
         lines.push(summary.url.clone());
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, VecDeque};
+    use std::path::PathBuf;
+
+    use crate::agent::AgentState;
+    use crate::config::{Checks, Config, EscapeKey};
+    use crate::github::PrCache;
+    use crate::repo::Repository;
+    use crate::session::Session;
+
+    use super::render_frame;
+
+    #[test]
+    fn render_frame_does_not_clear_the_whole_screen() {
+        let repo = Repository {
+            root: PathBuf::from("/repo"),
+        };
+        let config = Config {
+            default_agent: "codex".to_string(),
+            default_base: None,
+            plan_dir: "plans".to_string(),
+            review_packet_dir: ".agent/review".to_string(),
+            worktree_command: "wt".to_string(),
+            escape_key: EscapeKey::EscEsc,
+            checks: Checks::default(),
+            tools: BTreeMap::new(),
+            agent_commands: BTreeMap::new(),
+            agent_prompt_modes: BTreeMap::new(),
+            user_path: PathBuf::from("/tmp/user.toml"),
+            repo_path: PathBuf::from("/repo/.prism.toml"),
+        };
+        let sessions = vec![Session {
+            path: PathBuf::from("/repo"),
+            path_display: "/repo".to_string(),
+            branch: "main".to_string(),
+            prompt_summary: "summary".to_string(),
+            adopted: true,
+            hidden: false,
+            status_label: "clean".to_string(),
+            agent: None,
+            agent_output: VecDeque::new(),
+            agent_state: AgentState::Idle,
+            pr: PrCache::default(),
+        }];
+
+        let frame = render_frame(&repo, &config, &sessions, 0, "normal", 120, 20);
+
+        assert!(frame.starts_with("\x1b[?25l\x1b[H"));
+        assert!(!frame.contains("\x1b[2J"));
+        assert!(!frame.contains("\x1b[2K"));
+    }
 }

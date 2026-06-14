@@ -4,7 +4,7 @@ use std::process::Command;
 
 use crate::agent::{AgentAdapter, AgentProcess, AgentState};
 use crate::git::{has_upstream, selected_dirty, worktree_dirty};
-use crate::github::{PR_POLL_INTERVAL, refresh_pr_cache, remove_pr_cache};
+use crate::github::{PR_POLL_INTERVAL, PrCache, refresh_pr_cache, remove_pr_cache};
 use crate::plan::{build_plan_prompt, default_plan_path, infer_total_phases, run_codex_plan};
 use crate::process::{run_configured_commands, run_status};
 use crate::review::write_review_packet;
@@ -113,12 +113,14 @@ impl Tui {
         Ok(())
     }
 
-    pub(crate) fn poll_agents(&mut self) {
+    pub(crate) fn poll_agents(&mut self) -> bool {
+        let mut changed = false;
         for session in &mut self.sessions {
             if let Some(agent) = &mut session.agent {
                 for chunk in agent.drain_output() {
                     let _ = append_agent_log(&self.repo, &session.branch, &chunk);
                     session.agent_output.push_back(chunk);
+                    changed = true;
                 }
                 while session.agent_output.len() > 200 {
                     session.agent_output.pop_front();
@@ -127,13 +129,16 @@ impl Tui {
                     if let Some(state) = agent.try_wait() {
                         session.agent_state = state;
                         let _ = save_agent_state(&self.repo, &session.branch, state);
+                        changed = true;
                     }
                 }
             }
         }
+        changed
     }
 
-    pub(crate) fn poll_pull_requests(&mut self, force: bool) {
+    pub(crate) fn poll_pull_requests(&mut self, force: bool) -> bool {
+        let mut changed = false;
         for session in &mut self.sessions {
             let due = session
                 .pr
@@ -141,6 +146,7 @@ impl Tui {
                 .map(|last| last.elapsed() >= PR_POLL_INTERVAL)
                 .unwrap_or(true);
             if force || due {
+                let before = pr_render_signature(&session.pr);
                 refresh_pr_cache(
                     &self.repo,
                     &session.branch,
@@ -149,8 +155,10 @@ impl Tui {
                     &self.config,
                     force,
                 );
+                changed |= before != pr_render_signature(&session.pr);
             }
         }
+        changed
     }
 
     pub(crate) fn create_or_update_pr(&mut self) -> Result<(), String> {
@@ -490,4 +498,11 @@ impl Tui {
         clear_hidden(&self.repo, branch)?;
         Ok(())
     }
+}
+
+fn pr_render_signature(cache: &PrCache) -> String {
+    format!(
+        "{:?}|{:?}|{:?}|{:?}",
+        cache.summary, cache.details, cache.last_refreshed, cache.error
+    )
 }

@@ -51,11 +51,19 @@ impl Tui {
         let mut buffer = [0_u8; 64];
         let mut key_input = KeyInput::default();
         let mut pending_g = false;
+        let mut last_size = terminal_size();
 
         loop {
-            self.poll_agents();
-            self.poll_pull_requests(false);
-            self.draw()?;
+            let agents_changed = self.poll_agents();
+            let prs_changed = self.poll_pull_requests(false);
+            let current_size = terminal_size();
+            let resized = current_size != last_size;
+            if resized {
+                last_size = current_size;
+            }
+            if agents_changed || prs_changed || resized {
+                self.draw()?;
+            }
             let count = match stdin.read(&mut buffer) {
                 Ok(count) => count,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
