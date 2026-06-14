@@ -357,7 +357,7 @@ mod tests {
             root: PathBuf::from("/repo"),
         };
         let config = Config {
-            default_agent: "codex".to_string(),
+            default_agent: "opencode".to_string(),
             default_base: None,
             plan_dir: "plans".to_string(),
             review_packet_dir: ".agent/review".to_string(),
@@ -397,7 +397,7 @@ mod tests {
             root: PathBuf::from("/repo"),
         };
         let config = Config {
-            default_agent: "codex".to_string(),
+            default_agent: "opencode".to_string(),
             default_base: None,
             plan_dir: "plans".to_string(),
             review_packet_dir: ".agent/review".to_string(),

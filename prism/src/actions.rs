@@ -12,7 +12,7 @@ use crate::session::{
     append_agent_log, clear_hidden, discover_sessions, mark_hidden, remove_logs,
     remove_process_state, remove_task_metadata, save_agent_state, write_task_metadata,
 };
-use crate::tmux::{agent_session_exists, attach_or_create_agent};
+use crate::tmux::{agent_session_running, attach_or_create_agent};
 use crate::tui::Tui;
 use crate::util::{truncate, yes};
 
@@ -173,13 +173,11 @@ impl Tui {
 
     pub(crate) fn refresh_tmux_agent_states(&mut self) {
         for session in &mut self.sessions {
-            let state = if agent_session_exists(&self.repo, &self.config, session) {
-                Some(AgentState::Running)
-            } else if session.agent_state == AgentState::NeedsRestart {
-                Some(AgentState::ExitedOk)
-            } else {
-                None
-            };
+            let state = tmux_agent_state(
+                session.agent_state,
+                session.agent.is_some(),
+                agent_session_running(&self.repo, &self.config, session),
+            );
             if let Some(state) = state {
                 if session.agent_state != state {
                     session.agent_state = state;
@@ -528,9 +526,51 @@ impl Tui {
     }
 }
 
+fn tmux_agent_state(
+    current: AgentState,
+    has_embedded_agent: bool,
+    tmux_agent_running: bool,
+) -> Option<AgentState> {
+    if tmux_agent_running && !has_embedded_agent {
+        return Some(AgentState::NeedsInput);
+    }
+    if !has_embedded_agent && matches!(current, AgentState::Running | AgentState::NeedsRestart) {
+        return Some(AgentState::ExitedOk);
+    }
+    None
+}
+
 fn pr_render_signature(cache: &PrCache) -> String {
     format!(
         "{:?}|{:?}|{:?}|{:?}",
         cache.summary, cache.details, cache.last_refreshed, cache.error
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::agent::AgentState;
+
+    use super::tmux_agent_state;
+
+    #[test]
+    fn idle_tmux_opencode_session_does_not_count_as_running_agent() {
+        let state = tmux_agent_state(AgentState::Idle, false, true);
+
+        assert_eq!(state, Some(AgentState::NeedsInput));
+    }
+
+    #[test]
+    fn stale_running_state_without_process_is_cleared() {
+        let state = tmux_agent_state(AgentState::Running, false, false);
+
+        assert_eq!(state, Some(AgentState::ExitedOk));
+    }
+
+    #[test]
+    fn embedded_agent_process_owns_running_state() {
+        let state = tmux_agent_state(AgentState::Running, true, true);
+
+        assert_eq!(state, None);
+    }
 }

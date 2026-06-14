@@ -9,7 +9,7 @@ use crate::repo::Repository;
 use crate::session::discover_sessions;
 use crate::util::home_dir;
 
-pub const AGENT_CANDIDATES: [&str; 5] = ["pi", "claude", "opencode", "codex", "aider"];
+pub const AGENT_CANDIDATES: [&str; 1] = ["opencode"];
 
 #[derive(Clone, Debug, Default)]
 pub struct Checks {
@@ -84,11 +84,7 @@ impl Config {
             ("git", "git"),
             ("tmux", "tmux"),
             ("lazygit", "lazygit"),
-            ("codex", "codex"),
-            ("pi", "pi"),
-            ("claude", "claude"),
             ("opencode", "opencode"),
-            ("aider", "aider"),
             ("codex_plan", "codex-plan"),
         ]
         .into_iter()
@@ -96,7 +92,7 @@ impl Config {
         .collect();
 
         Self {
-            default_agent: "ask".to_string(),
+            default_agent: "opencode".to_string(),
             default_base: None,
             plan_dir: "plans".to_string(),
             review_packet_dir: ".agent/review".to_string(),
@@ -189,10 +185,13 @@ impl Config {
     }
 
     pub fn agent_command(&self, name: &str) -> String {
-        self.agent_commands
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| self.tool(name))
+        if let Some(command) = self.agent_commands.get(name) {
+            return command.clone();
+        }
+        if name == "opencode" {
+            return format!("{} run --format json", self.tool("opencode"));
+        }
+        self.tool(name)
     }
 
     pub fn agent_prompt_mode(&self, name: &str) -> PromptMode {
@@ -288,12 +287,16 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
             println!("default agent: ask (blocked until an agent is configured)");
         }
     } else {
-        let exists = agent_command_exists(config, &config.default_agent);
-        println!(
-            "default agent: {} ({})",
-            config.default_agent,
-            if exists { "available" } else { "missing" }
-        );
+        if config.default_agent == "opencode" {
+            let exists = agent_command_exists(config, &config.default_agent);
+            println!(
+                "default agent: {} ({})",
+                config.default_agent,
+                if exists { "available" } else { "missing" }
+            );
+        } else {
+            println!("default agent: {} (unsupported)", config.default_agent);
+        }
     }
 
     println!();
@@ -425,6 +428,12 @@ pub fn ensure_default_agent_noninteractive(config: &mut Config) -> Result<(), St
 }
 
 fn ensure_configured_default_agent(config: &Config) -> Result<(), String> {
+    if config.default_agent != "opencode" {
+        return Err(format!(
+            "unsupported default_agent '{}'; Prism uses opencode so it can observe agent status and output",
+            config.default_agent
+        ));
+    }
     if agent_command_exists(config, &config.default_agent) {
         return Ok(());
     }
@@ -538,5 +547,35 @@ mod tests {
     fn parses_escape_key() {
         assert_eq!(EscapeKey::parse("ctrl-space"), Some(EscapeKey::CtrlSpace));
         assert_eq!(EscapeKey::parse("esc-esc"), Some(EscapeKey::EscEsc));
+    }
+
+    #[test]
+    fn defaults_to_opencode_json_run_backend() {
+        let config = Config::defaults(
+            PathBuf::from("/tmp/user.toml"),
+            PathBuf::from("/repo/.prism.toml"),
+        );
+
+        assert_eq!(AGENT_CANDIDATES, ["opencode"]);
+        assert_eq!(config.default_agent, "opencode");
+        assert_eq!(
+            config.agent_command("opencode"),
+            "opencode run --format json"
+        );
+        assert_eq!(config.agent_prompt_mode("opencode"), PromptMode::Argument);
+    }
+
+    #[test]
+    fn rejects_non_opencode_default_agent() {
+        let mut config = Config::defaults(
+            PathBuf::from("/tmp/user.toml"),
+            PathBuf::from("/repo/.prism.toml"),
+        );
+        config.default_agent = "other-agent".to_string();
+
+        let error = ensure_configured_default_agent(&config).unwrap_err();
+
+        assert!(error.contains("unsupported default_agent"));
+        assert!(error.contains("opencode"));
     }
 }

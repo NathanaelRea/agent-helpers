@@ -10,15 +10,15 @@ Implemented so far:
 - existing Git worktree discovery
 - branch, prompt summary, adoption state, and Git status display including
   clean, dirty, ahead, behind, and diverged states
-- first-run agent backend detection and default-agent selection
+- OpenCode backend detection
 - a dependency-free two-panel TUI skeleton with Vim-style session navigation
 - `c` create-session flow using `wt switch -c <branch>`
 - dirty-worktree guard for session creation, overridable with `--allow-dirty`
 - task prompt metadata under `.prism/tasks/<branch>.json`
-- tmux-backed persistent agent CLI sessions with Enter attach
-- embedded PTY launch for prompt-driven agent actions
-- built-in backend presets for `codex`, `pi`, `claude`, `opencode`, and `aider`
-- custom command-template backends via config
+- tmux-backed persistent OpenCode TUI sessions with Enter attach
+- embedded PTY launch for prompt-driven OpenCode actions
+- OpenCode JSON event output for prompt-driven actions
+- optional OpenCode command-template overrides via config
 - backend prompt delivery modes: `stdin`, `argument`, `temp-file`, and `interactive`
 - live process state display: idle, running, done, failed, needs input, or needs restart
 - lightweight process markers and raw agent logs under `.prism/`
@@ -54,8 +54,8 @@ prism run-plan plans/my-branch.md
 ```
 
 Required tools for the TUI are `git`, `gh`, `tmux`, the configured worktree
-command (`wt` by default), and one configured agent backend. `codex-plan` is
-optional and only needed for the temporary `x`/`run-plan` path.
+command (`wt` by default), and `opencode`. `codex-plan` is optional and only
+needed for the temporary `x`/`run-plan` path.
 
 On startup, Prism checks the repository layout before opening the board. If the
 current checkout is not on the default branch, no additional worktree sessions
@@ -66,10 +66,11 @@ worktree and switch the original checkout back to the default branch.
 The TUI supports `?` for the full keybinding dialog.
 
 Pressing Enter attaches to a persistent tmux session for the selected worktree.
-If that worktree does not have an agent tmux session yet, Prism starts one in
-the worktree directory with the configured default agent command. Detach from
-tmux, for example with `Ctrl-b d`, to return to Prism. Other worktree agent
-sessions keep running in parallel while detached.
+If that worktree does not have an agent tmux session yet, Prism starts
+`opencode` in the worktree directory. Detach from tmux, for example with
+`Ctrl-b d`, to return to Prism. Other worktree agent sessions keep running in
+parallel while detached. Prism only treats the tmux session as running while the
+pane is actually running OpenCode.
 
 PR polling is read-only. Prism does not commit, push, or create a pull request
 unless you press the matching explicit action and confirm the prompt. The `P`
@@ -107,13 +108,13 @@ Session cleanup keys:
 - `D` deletes Prism local data and, after confirmation, the local worktree and
   local branch. Remote branches and pull requests are not deleted.
 
-Custom backend example:
+OpenCode command override example:
 
 ```toml
-default_agent = "my-agent"
+default_agent = "opencode"
 
-[agents.my-agent]
-command = "my-agent --prompt {prompt}"
+[agents.opencode]
+command = "opencode run --format json"
 prompt_mode = "argument"
 
 [checks]
@@ -124,17 +125,16 @@ review_fix = []
 
 Backend notes:
 
-- Built-in `codex`, `pi`, `claude`, `opencode`, and `aider` adapters default to
-  `stdin`, which starts the configured command in Prism's PTY and writes the
-  initial prompt into it for prompt-driven actions.
-- The Enter tmux attach path starts the configured agent command directly
-  without sending an initial prompt. Custom commands used with Enter should be
-  interactive commands and must not contain `{prompt}` or `{prompt_file}`.
+- Prism uses OpenCode as its agent backend. Prompt-driven actions default to
+  `opencode run --format json <prompt>` so Prism can capture structured event
+  output.
+- The Enter tmux attach path starts `opencode` directly without sending an
+  initial prompt, regardless of the prompt-driven command override.
 - `argument` appends the prompt as one argv value, or replaces `{prompt}` when
   present in the command template.
 - `temp-file` writes the prompt to a temporary markdown file and appends that
   path, or replaces `{prompt_file}` when present.
 - `interactive` starts the backend without sending a prompt.
-- Prism does not translate prompts into backend-specific slash commands yet;
-  configure `command` and `prompt_mode` per repo when a backend requires a
-  different invocation style.
+- Prism does not translate prompts into OpenCode-specific slash commands yet;
+  configure `agents.opencode.command` and `agents.opencode.prompt_mode` per repo
+  when a different invocation style is needed.

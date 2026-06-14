@@ -42,7 +42,7 @@ impl PromptMode {
 
 pub fn builtin_prompt_mode(agent: &str) -> PromptMode {
     match agent {
-        "codex" | "pi" | "claude" | "opencode" | "aider" => PromptMode::Stdin,
+        "opencode" => PromptMode::Argument,
         _ => PromptMode::Interactive,
     }
 }
@@ -383,5 +383,10 @@ mod tests {
         let launch = adapter.prepare_launch("fix this").unwrap();
         assert_eq!(launch.argv, vec!["my-agent"]);
         assert_eq!(launch.stdin_prompt.as_deref(), Some("fix this"));
+    }
+
+    #[test]
+    fn opencode_uses_argument_prompt_for_json_run_mode() {
+        assert_eq!(builtin_prompt_mode("opencode"), PromptMode::Argument);
     }
 }

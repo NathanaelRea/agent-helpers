@@ -2,7 +2,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::config::Config;
-use crate::process::{run_status, split_command_words};
+use crate::process::{run_capture, run_status, split_command_words};
 use crate::repo::Repository;
 use crate::session::Session;
 use crate::util::safe_branch_filename;
@@ -29,8 +29,14 @@ pub fn attach_or_create_agent(
     )
 }
 
-pub fn agent_session_exists(repo: &Repository, config: &Config, session: &Session) -> bool {
-    session_exists(config, &agent_session_name(repo, &session.branch))
+pub fn agent_session_running(repo: &Repository, config: &Config, session: &Session) -> bool {
+    let name = agent_session_name(repo, &session.branch);
+    if !session_exists(config, &name) {
+        return false;
+    }
+    pane_current_command(config, &name)
+        .map(|command| pane_command_matches_agent(config, &command))
+        .unwrap_or(false)
 }
 
 pub fn agent_session_name(repo: &Repository, branch: &str) -> String {
@@ -57,7 +63,7 @@ fn session_exists(config: &Config, name: &str) -> bool {
 }
 
 fn agent_shell_command(config: &Config) -> Result<String, String> {
-    let argv = split_command_words(&config.agent_command(&config.default_agent));
+    let argv = interactive_agent_argv(config);
     if argv.is_empty() {
         return Err(format!(
             "agent '{}' has an empty command",
@@ -75,6 +81,38 @@ fn agent_shell_command(config: &Config) -> Result<String, String> {
         .map(|arg| shell_quote(arg))
         .collect::<Vec<_>>()
         .join(" "))
+}
+
+fn interactive_agent_argv(config: &Config) -> Vec<String> {
+    if config.default_agent == "opencode" {
+        vec![config.tool("opencode")]
+    } else {
+        split_command_words(&config.agent_command(&config.default_agent))
+    }
+}
+
+fn pane_current_command(config: &Config, name: &str) -> Option<String> {
+    run_capture(
+        Command::new(config.tool("tmux"))
+            .env_remove("TMUX")
+            .args(["display-message", "-p", "-t"])
+            .arg(format!("{name}:0.0"))
+            .arg("#{pane_current_command}"),
+    )
+    .ok()
+    .map(|output| output.trim().to_string())
+    .filter(|output| !output.is_empty())
+}
+
+fn pane_command_matches_agent(config: &Config, pane_command: &str) -> bool {
+    let Some(expected) = interactive_agent_argv(config).first().cloned() else {
+        return false;
+    };
+    let expected = Path::new(&expected)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&expected);
+    pane_command == expected
 }
 
 fn shell_quote(value: &str) -> String {
@@ -120,7 +158,7 @@ mod tests {
     use crate::config::{Checks, Config, EscapeKey};
     use crate::repo::Repository;
 
-    use super::{agent_session_name, shell_quote};
+    use super::{agent_session_name, pane_command_matches_agent, shell_quote};
 
     #[test]
     fn tmux_session_names_are_stable_and_safe() {
@@ -138,7 +176,7 @@ mod tests {
 
     #[test]
     fn shell_quote_preserves_argument_boundaries() {
-        assert_eq!(shell_quote("codex"), "codex");
+        assert_eq!(shell_quote("opencode"), "opencode");
         assert_eq!(shell_quote(""), "''");
         assert_eq!(shell_quote("two words"), "'two words'");
         assert_eq!(shell_quote("that's"), "'that'\"'\"'s'");
@@ -167,5 +205,27 @@ mod tests {
         let error = super::agent_shell_command(&config).unwrap_err();
 
         assert!(error.contains("prompt placeholder"));
+    }
+
+    #[test]
+    fn pane_command_only_counts_the_configured_agent_as_running() {
+        let config = Config {
+            default_agent: "opencode".to_string(),
+            default_base: None,
+            plan_dir: "plans".to_string(),
+            review_packet_dir: ".agent/review".to_string(),
+            worktree_command: "wt".to_string(),
+            escape_key: EscapeKey::EscEsc,
+            checks: Checks::default(),
+            tools: BTreeMap::new(),
+            agent_commands: BTreeMap::new(),
+            agent_prompt_modes: BTreeMap::new(),
+            user_path: PathBuf::from("/tmp/user.toml"),
+            repo_path: PathBuf::from("/repo/.prism.toml"),
+        };
+
+        assert!(pane_command_matches_agent(&config, "opencode"));
+        assert!(!pane_command_matches_agent(&config, "bash"));
+        assert!(!pane_command_matches_agent(&config, "zsh"));
     }
 }
