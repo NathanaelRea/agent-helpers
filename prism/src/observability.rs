@@ -503,6 +503,20 @@ pub fn run_readonly_query(repo: &Repository, query: &str) -> Result<(), String> 
     Ok(())
 }
 
+pub fn with_writable_db<T>(
+    repo: &Repository,
+    run: impl FnOnce(&Connection) -> Result<T, String>,
+) -> Result<T, String> {
+    let path = db_path(repo);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("create db dir: {error}"))?;
+    }
+    let conn =
+        Connection::open(&path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    create_schema(&conn)?;
+    run(&conn)
+}
+
 fn record_panic(message: String) {
     let event = Event {
         time_unix_ms: now_ms(),
@@ -838,6 +852,43 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
           time_finished_unix_ms integer,
           status text not null,
           error text
+        );
+
+        create table if not exists task_metadata (
+          branch text primary key,
+          prompt_summary text not null,
+          initial_prompt text not null,
+          worktree text not null,
+          updated_unix_ms integer not null
+        );
+
+        create table if not exists hidden_session (
+          branch text primary key,
+          hidden_unix_ms integer not null
+        );
+
+        create table if not exists agent_state (
+          branch text primary key,
+          state text not null,
+          updated_unix_ms integer not null
+        );
+
+        create table if not exists pr_cache (
+          branch text primary key,
+          number integer not null,
+          title text not null,
+          url text not null,
+          state text not null,
+          review_decision text not null,
+          head_ref text not null,
+          base_ref text not null,
+          head_sha text not null,
+          updated_at text not null,
+          check_status text not null,
+          merged integer not null,
+          draft integer not null,
+          last_refreshed text not null,
+          refreshed_unix_ms integer not null
         );
         ",
     )

@@ -1,15 +1,17 @@
-use std::fs;
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
+use rusqlite::params;
+
 use crate::config::Config;
 use crate::json::{
-    collect_json_string_fields, json_bool_field, json_escape, json_login_field,
-    json_objects_in_array, json_string_field, json_top_level_objects, json_u64_field,
+    collect_json_string_fields, json_bool_field, json_login_field, json_objects_in_array,
+    json_string_field, json_top_level_objects, json_u64_field,
 };
+use crate::observability;
 use crate::process::run_capture;
 use crate::repo::Repository;
-use crate::util::{safe_branch_filename, timestamp_label};
+use crate::util::timestamp_label;
 
 pub const PR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -87,34 +89,43 @@ pub struct PrReviewComment {
 }
 
 pub fn load_pr_cache(repo: &Repository, branch: &str) -> PrCache {
-    let path = pr_cache_path(repo, branch);
-    let Ok(text) = fs::read_to_string(path) else {
+    let Ok((summary, last_refreshed)) = observability::with_writable_db(repo, |conn| {
+        conn.query_row(
+            "select
+                number, title, url, state, review_decision, head_ref, base_ref, head_sha,
+                updated_at, check_status, merged, draft, last_refreshed
+             from pr_cache
+             where branch = ?1",
+            params![branch],
+            |row| {
+                Ok((
+                    PrSummary {
+                        number: row.get(0)?,
+                        title: row.get(1)?,
+                        url: row.get(2)?,
+                        state: row.get(3)?,
+                        review_decision: row.get(4)?,
+                        head_ref: row.get(5)?,
+                        base_ref: row.get(6)?,
+                        head_sha: row.get(7)?,
+                        updated_at: row.get(8)?,
+                        check_status: row.get(9)?,
+                        merged: row.get(10)?,
+                        draft: row.get(11)?,
+                    },
+                    row.get::<_, String>(12)?,
+                ))
+            },
+        )
+        .map_err(|error| format!("read PR cache: {error}"))
+    }) else {
         return PrCache::default();
     };
-    let Some(number) = json_u64_field(&text, "number") else {
-        return PrCache::default();
-    };
-    let summary = PrSummary {
-        number,
-        title: json_string_field(&text, "title").unwrap_or_default(),
-        url: json_string_field(&text, "url").unwrap_or_default(),
-        state: json_string_field(&text, "state").unwrap_or_default(),
-        review_decision: json_string_field(&text, "reviewDecision")
-            .unwrap_or_else(|| "UNKNOWN".to_string()),
-        head_ref: json_string_field(&text, "headRefName").unwrap_or_default(),
-        base_ref: json_string_field(&text, "baseRefName").unwrap_or_default(),
-        head_sha: json_string_field(&text, "headRefOid").unwrap_or_default(),
-        updated_at: json_string_field(&text, "updatedAt").unwrap_or_default(),
-        check_status: json_string_field(&text, "checkStatus").unwrap_or_else(|| "unknown".into()),
-        merged: parse_merged_status(&text),
-        draft: json_bool_field(&text, "isDraft").unwrap_or(false),
-    };
-    let last_refreshed = json_string_field(&text, "lastRefreshed");
     let signature = Some(summary.signature());
     PrCache {
         summary: Some(summary),
         details: None,
-        last_refreshed,
+        last_refreshed: Some(last_refreshed),
         signature,
         ..PrCache::default()
     }
@@ -405,45 +416,68 @@ fn parse_merged_status(raw: &str) -> bool {
     })
 }
 
-fn pr_cache_path(repo: &Repository, branch: &str) -> std::path::PathBuf {
-    repo.prism_dir()
-        .join("pr")
-        .join(format!("{}.json", safe_branch_filename(branch)))
-}
-
 pub fn remove_pr_cache(repo: &Repository, branch: &str) -> Result<(), String> {
-    let path = pr_cache_path(repo, branch);
-    if path.exists() {
-        fs::remove_file(path).map_err(|error| format!("remove PR cache: {error}"))?;
-    }
-    Ok(())
+    observability::with_writable_db(repo, |conn| {
+        conn.execute("delete from pr_cache where branch = ?1", params![branch])
+            .map_err(|error| format!("remove PR cache: {error}"))?;
+        Ok(())
+    })
 }
 
 fn save_pr_cache(repo: &Repository, branch: &str, cache: &PrCache) -> Result<(), String> {
     let Some(summary) = &cache.summary else {
         return Ok(());
     };
-    let path = pr_cache_path(repo, branch);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("create PR cache dir: {error}"))?;
-    }
-    let text = format!(
-        "{{\n  \"number\": {},\n  \"title\": \"{}\",\n  \"url\": \"{}\",\n  \"state\": \"{}\",\n  \"reviewDecision\": \"{}\",\n  \"headRefName\": \"{}\",\n  \"baseRefName\": \"{}\",\n  \"headRefOid\": \"{}\",\n  \"updatedAt\": \"{}\",\n  \"checkStatus\": \"{}\",\n  \"merged\": {},\n  \"isDraft\": {},\n  \"lastRefreshed\": \"{}\"\n}}\n",
-        summary.number,
-        json_escape(&summary.title),
-        json_escape(&summary.url),
-        json_escape(&summary.state),
-        json_escape(&summary.review_decision),
-        json_escape(&summary.head_ref),
-        json_escape(&summary.base_ref),
-        json_escape(&summary.head_sha),
-        json_escape(&summary.updated_at),
-        json_escape(&summary.check_status),
-        summary.merged,
-        summary.draft,
-        json_escape(cache.last_refreshed.as_deref().unwrap_or(""))
-    );
-    fs::write(path, text).map_err(|error| format!("write PR cache: {error}"))
+    observability::with_writable_db(repo, |conn| {
+        conn.execute(
+            "insert into pr_cache (
+                branch, number, title, url, state, review_decision, head_ref, base_ref,
+                head_sha, updated_at, check_status, merged, draft, last_refreshed,
+                refreshed_unix_ms
+             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             on conflict(branch) do update set
+                number = excluded.number,
+                title = excluded.title,
+                url = excluded.url,
+                state = excluded.state,
+                review_decision = excluded.review_decision,
+                head_ref = excluded.head_ref,
+                base_ref = excluded.base_ref,
+                head_sha = excluded.head_sha,
+                updated_at = excluded.updated_at,
+                check_status = excluded.check_status,
+                merged = excluded.merged,
+                draft = excluded.draft,
+                last_refreshed = excluded.last_refreshed,
+                refreshed_unix_ms = excluded.refreshed_unix_ms",
+            params![
+                branch,
+                summary.number,
+                summary.title.as_str(),
+                summary.url.as_str(),
+                summary.state.as_str(),
+                summary.review_decision.as_str(),
+                summary.head_ref.as_str(),
+                summary.base_ref.as_str(),
+                summary.head_sha.as_str(),
+                summary.updated_at.as_str(),
+                summary.check_status.as_str(),
+                summary.merged,
+                summary.draft,
+                cache.last_refreshed.as_deref().unwrap_or(""),
+                unix_seconds(),
+            ],
+        )
+        .map_err(|error| format!("write PR cache: {error}"))?;
+        Ok(())
+    })
+}
+
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

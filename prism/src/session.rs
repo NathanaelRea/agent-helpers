@@ -3,12 +3,16 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use rusqlite::params;
 
 use crate::agent::{AgentProcess, AgentState};
 use crate::config::Config;
 use crate::git::git_status_label;
 use crate::github::{PrCache, load_pr_cache};
-use crate::json::{json_escape, json_string_field};
+use crate::json::json_string_field;
+use crate::observability;
 use crate::process::run_capture;
 use crate::repo::Repository;
 use crate::util::{safe_branch_filename, truncate};
@@ -71,15 +75,17 @@ pub fn discover_sessions(repo: &Repository, config: &Config) -> Result<Vec<Sessi
 }
 
 fn build_session(repo: &Repository, path: PathBuf, branch: String, config: &Config) -> Session {
-    let metadata_path = task_metadata_path(repo, &branch);
     let legacy_metadata_path = path
         .join(".agent/tasks")
         .join(format!("{}.json", safe_branch_filename(&branch)));
-    let prompt_summary = read_prompt_summary(&metadata_path)
+    let metadata = load_task_metadata(repo, &branch);
+    let prompt_summary = metadata
+        .as_ref()
+        .map(|metadata| metadata.prompt_summary.clone())
         .or_else(|| read_prompt_summary(&legacy_metadata_path))
         .unwrap_or_default();
-    let adopted = metadata_path.exists() || legacy_metadata_path.exists();
-    let hidden = hidden_path(repo, &branch).exists();
+    let adopted = metadata.is_some() || legacy_metadata_path.exists();
+    let hidden = is_hidden(repo, &branch);
     let status_label = git_status_label(&path, config);
     let path_display = path.display().to_string();
     let agent_state = load_agent_state(repo, &branch).unwrap_or(AgentState::Idle);
@@ -104,35 +110,63 @@ pub fn write_task_metadata(
     session: &Session,
     initial_prompt: &str,
 ) -> Result<(), String> {
-    let path = task_metadata_path(repo, &session.branch);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("create task metadata dir: {error}"))?;
-    }
     let summary = truncate(&initial_prompt.replace('\n', " "), 50);
-    let text = format!(
-        "{{\n  \"branch\": \"{}\",\n  \"prompt_summary\": \"{}\",\n  \"initial_prompt\": \"{}\",\n  \"worktree\": \"{}\"\n}}\n",
-        json_escape(&session.branch),
-        json_escape(&summary),
-        json_escape(initial_prompt),
-        json_escape(&session.path_display)
-    );
-    fs::write(path, text).map_err(|error| format!("write task metadata: {error}"))
+    observability::with_writable_db(repo, |conn| {
+        conn.execute(
+            "insert into task_metadata (
+                branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
+             ) values (?1, ?2, ?3, ?4, ?5)
+             on conflict(branch) do update set
+                prompt_summary = excluded.prompt_summary,
+                initial_prompt = excluded.initial_prompt,
+                worktree = excluded.worktree,
+                updated_unix_ms = excluded.updated_unix_ms",
+            params![
+                session.branch.as_str(),
+                summary.as_str(),
+                initial_prompt,
+                session.path_display.as_str(),
+                unix_seconds(),
+            ],
+        )
+        .map_err(|error| format!("write task metadata: {error}"))?;
+        Ok(())
+    })
 }
 
 pub fn remove_task_metadata(repo: &Repository, branch: &str) -> Result<(), String> {
-    remove_if_exists(task_metadata_path(repo, branch), "task metadata")
+    observability::with_writable_db(repo, |conn| {
+        conn.execute(
+            "delete from task_metadata where branch = ?1",
+            params![branch],
+        )
+        .map_err(|error| format!("remove task metadata: {error}"))?;
+        Ok(())
+    })
 }
 
 pub fn mark_hidden(repo: &Repository, branch: &str) -> Result<(), String> {
-    let path = hidden_path(repo, branch);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("create hidden dir: {error}"))?;
-    }
-    fs::write(path, b"hidden\n").map_err(|error| format!("write hidden marker: {error}"))
+    observability::with_writable_db(repo, |conn| {
+        conn.execute(
+            "insert into hidden_session (branch, hidden_unix_ms)
+             values (?1, ?2)
+             on conflict(branch) do update set hidden_unix_ms = excluded.hidden_unix_ms",
+            params![branch, unix_seconds()],
+        )
+        .map_err(|error| format!("write hidden marker: {error}"))?;
+        Ok(())
+    })
 }
 
 pub fn clear_hidden(repo: &Repository, branch: &str) -> Result<(), String> {
-    remove_if_exists(hidden_path(repo, branch), "hidden marker")
+    observability::with_writable_db(repo, |conn| {
+        conn.execute(
+            "delete from hidden_session where branch = ?1",
+            params![branch],
+        )
+        .map_err(|error| format!("remove hidden marker: {error}"))?;
+        Ok(())
+    })
 }
 
 pub fn append_agent_log(repo: &Repository, branch: &str, chunk: &str) -> Result<(), String> {
@@ -158,25 +192,71 @@ pub fn remove_logs(repo: &Repository, branch: &str) -> Result<(), String> {
 }
 
 pub fn save_agent_state(repo: &Repository, branch: &str, state: AgentState) -> Result<(), String> {
-    let path = process_state_path(repo, branch);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("create process dir: {error}"))?;
-    }
-    fs::write(
-        path,
-        format!("{{\n  \"state\": \"{}\"\n}}\n", json_escape(state.label())),
-    )
-    .map_err(|error| format!("write process state: {error}"))
+    observability::with_writable_db(repo, |conn| {
+        conn.execute(
+            "insert into agent_state (branch, state, updated_unix_ms)
+             values (?1, ?2, ?3)
+             on conflict(branch) do update set
+                state = excluded.state,
+                updated_unix_ms = excluded.updated_unix_ms",
+            params![branch, state.label(), unix_seconds()],
+        )
+        .map_err(|error| format!("write process state: {error}"))?;
+        Ok(())
+    })
 }
 
 pub fn remove_process_state(repo: &Repository, branch: &str) -> Result<(), String> {
-    remove_if_exists(process_state_path(repo, branch), "process state")
+    observability::with_writable_db(repo, |conn| {
+        conn.execute("delete from agent_state where branch = ?1", params![branch])
+            .map_err(|error| format!("remove process state: {error}"))?;
+        Ok(())
+    })
 }
 
 fn load_agent_state(repo: &Repository, branch: &str) -> Option<AgentState> {
-    let text = fs::read_to_string(process_state_path(repo, branch)).ok()?;
-    let state = json_string_field(&text, "state")?;
+    let state = observability::with_writable_db(repo, |conn| {
+        conn.query_row(
+            "select state from agent_state where branch = ?1",
+            params![branch],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| format!("read process state: {error}"))
+    })
+    .ok()?;
     AgentState::parse(&state)
+}
+
+struct TaskMetadata {
+    prompt_summary: String,
+}
+
+fn load_task_metadata(repo: &Repository, branch: &str) -> Option<TaskMetadata> {
+    observability::with_writable_db(repo, |conn| {
+        conn.query_row(
+            "select prompt_summary from task_metadata where branch = ?1",
+            params![branch],
+            |row| {
+                Ok(TaskMetadata {
+                    prompt_summary: row.get(0)?,
+                })
+            },
+        )
+        .map_err(|error| format!("read task metadata: {error}"))
+    })
+    .ok()
+}
+
+fn is_hidden(repo: &Repository, branch: &str) -> bool {
+    observability::with_writable_db(repo, |conn| {
+        conn.query_row(
+            "select 1 from hidden_session where branch = ?1",
+            params![branch],
+            |_| Ok(()),
+        )
+        .map_err(|error| format!("read hidden marker: {error}"))
+    })
+    .is_ok()
 }
 
 fn read_prompt_summary(path: &Path) -> Option<String> {
@@ -189,28 +269,10 @@ fn read_prompt_summary(path: &Path) -> Option<String> {
     None
 }
 
-fn task_metadata_path(repo: &Repository, branch: &str) -> PathBuf {
-    repo.prism_dir()
-        .join("tasks")
-        .join(format!("{}.json", safe_branch_filename(branch)))
-}
-
-fn hidden_path(repo: &Repository, branch: &str) -> PathBuf {
-    repo.prism_dir()
-        .join("hidden")
-        .join(format!("{}.hidden", safe_branch_filename(branch)))
-}
-
 fn log_path(repo: &Repository, branch: &str) -> PathBuf {
     repo.prism_dir()
         .join("logs")
         .join(format!("{}.log", safe_branch_filename(branch)))
-}
-
-fn process_state_path(repo: &Repository, branch: &str) -> PathBuf {
-    repo.prism_dir()
-        .join("process")
-        .join(format!("{}.json", safe_branch_filename(branch)))
 }
 
 fn remove_if_exists(path: PathBuf, label: &str) -> Result<(), String> {
@@ -218,4 +280,11 @@ fn remove_if_exists(path: PathBuf, label: &str) -> Result<(), String> {
         fs::remove_file(path).map_err(|error| format!("remove {label}: {error}"))?;
     }
     Ok(())
+}
+
+fn unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }

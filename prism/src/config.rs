@@ -7,7 +7,7 @@ use crate::agent::{PromptMode, agent_command_exists, builtin_prompt_mode, detect
 use crate::process::{command_exists, command_version, run_capture};
 use crate::repo::Repository;
 use crate::session::discover_sessions;
-use crate::util::home_dir;
+use crate::util::prism_config_dir;
 
 pub const AGENT_CANDIDATES: [&str; 1] = ["opencode"];
 
@@ -59,11 +59,7 @@ pub struct Config {
 
 impl Config {
     pub fn load(repo: &Repository) -> Self {
-        let home = home_dir();
-        let user_path = home
-            .as_deref()
-            .unwrap_or_else(|| Path::new("."))
-            .join(".config/prism/config.toml");
+        let user_path = prism_config_dir().join("config.toml");
         let repo_path = repo.root.join(".prism.toml");
         let mut config = Self::defaults(user_path, repo_path);
 

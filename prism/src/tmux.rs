@@ -6,7 +6,7 @@ use crate::config::Config;
 use crate::process::{run_capture, run_status, split_command_words};
 use crate::repo::Repository;
 use crate::session::Session;
-use crate::util::safe_branch_filename;
+use crate::util::{safe_branch_filename, stable_hash};
 
 const EXISTING_SESSION_READY_WAIT: Duration = Duration::from_millis(250);
 const CREATED_SESSION_READY_WAIT: Duration = Duration::from_millis(1_200);
@@ -287,15 +287,6 @@ fn shell_quote(value: &str) -> String {
         return value.to_string();
     }
     format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-fn stable_hash(path: &Path) -> u64 {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in path.display().to_string().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
 }
 
 fn safe_tmux_name(value: &str) -> String {

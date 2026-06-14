@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn truncate(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
@@ -27,6 +27,25 @@ pub fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(PathBuf::from)
 }
 
+pub fn prism_config_dir() -> PathBuf {
+    if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(path).join("prism");
+    }
+    if let Some(home) = home_dir() {
+        return home.join(".config/prism");
+    }
+    env::temp_dir().join("prism")
+}
+
+pub fn stable_hash(path: &Path) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in path.display().to_string().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 pub fn safe_branch_filename(branch: &str) -> String {
     branch
         .chars()
@@ -36,6 +55,24 @@ pub fn safe_branch_filename(branch: &str) -> String {
             ch => ch,
         })
         .collect()
+}
+
+pub fn safe_path_component(value: &str) -> String {
+    let safe = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if safe.is_empty() {
+        "repo".to_string()
+    } else {
+        safe
+    }
 }
 
 pub fn timestamp_label() -> String {
@@ -74,7 +111,9 @@ pub fn indent_markdown_block(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{single_line, truncate_line};
+    use std::path::Path;
+
+    use super::{safe_path_component, single_line, stable_hash, truncate_line};
 
     #[test]
     fn single_line_replaces_control_characters() {
@@ -87,5 +126,19 @@ mod tests {
     #[test]
     fn truncate_line_sanitizes_before_truncating() {
         assert_eq!(truncate_line("abc\ndef", 6), "abc d~");
+    }
+
+    #[test]
+    fn stable_hash_is_deterministic() {
+        assert_eq!(
+            stable_hash(Path::new("/repo/my project")),
+            stable_hash(Path::new("/repo/my project"))
+        );
+    }
+
+    #[test]
+    fn path_component_is_filesystem_safe() {
+        assert_eq!(safe_path_component("my project/foo"), "my_project_foo");
+        assert_eq!(safe_path_component(""), "repo");
     }
 }

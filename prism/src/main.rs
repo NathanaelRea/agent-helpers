@@ -131,12 +131,6 @@ fn run_debug_command(
             println!("user_config = {}", config.user_path.display());
             println!("repo_config = {}", config.repo_path.display());
             println!("logs_dir = {}", repo.prism_dir().join("logs").display());
-            println!(
-                "process_dir = {}",
-                repo.prism_dir().join("process").display()
-            );
-            println!("pr_cache_dir = {}", repo.prism_dir().join("pr").display());
-            println!("tasks_dir = {}", repo.prism_dir().join("tasks").display());
             Ok(())
         }
         DebugCommand::Info => {

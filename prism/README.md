@@ -14,18 +14,18 @@ Implemented so far:
 - a dependency-free two-panel TUI skeleton with Vim-style session navigation
 - `c` create-session flow using `wt switch -c <branch>`
 - dirty-worktree guard for session creation, overridable with `--allow-dirty`
-- task prompt metadata under `.prism/tasks/<branch>.json`
+- task prompt metadata in the per-repo SQLite database
 - tmux-backed persistent OpenCode TUI sessions with Enter attach
 - embedded PTY launch for prompt-driven OpenCode actions
 - OpenCode JSON event output for prompt-driven actions
 - optional OpenCode command-template overrides via config
 - backend prompt delivery modes: `stdin`, `argument`, `temp-file`, and `interactive`
 - live process state display: idle, running, done, failed, needs input, or needs restart
-- lightweight process markers and raw agent logs under `.prism/`
-- persistent TUI status line and action failure log under `.prism/runtime.log`
+- lightweight process state in SQLite and raw agent logs under `~/.config/prism/repos/<repo>/logs/`
+- persistent TUI status line and action failure log under `~/.config/prism/repos/<repo>/runtime.log`
 - current-branch GitHub pull request detection with a right-side PR panel
 - 10-second PR status/check polling through `gh pr view`
-- cached PR summary refresh under `.prism/pr/`, with detail refresh when comments,
+- cached PR summary refresh in SQLite, with detail refresh when comments,
   reviews, checks, files, or head SHA change
 - explicit `P` flow to push a clean branch and create a PR with `gh pr create --fill`
 - optional configured checks for `pre_pr`, `pre_push`, and `review_fix`
@@ -83,8 +83,8 @@ then `Initial prompt (optional):`; it does not open a modal dialog.
 
 Runtime diagnostics:
 
-- `.prism/logs/<branch>.log` stores raw agent output for a branch.
-- `.prism/runtime.log` stores Prism action failures shown in the TUI status line.
+- `~/.config/prism/repos/<repo>/logs/<branch>.log` stores raw agent output for a branch.
+- `~/.config/prism/repos/<repo>/runtime.log` stores Prism action failures shown in the TUI status line.
 - tmux agent sessions are named `prism-<repo-hash>-<branch>`.
 - PR refresh errors are cached and shown in the PR panel.
 
