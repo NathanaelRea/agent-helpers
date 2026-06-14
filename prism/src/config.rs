@@ -366,13 +366,7 @@ fn print_tool_status(label: &str, command: &str, required: bool) {
 
 pub fn ensure_default_agent(config: &mut Config) -> Result<(), String> {
     if config.default_agent != "ask" {
-        if agent_command_exists(config, &config.default_agent) {
-            return Ok(());
-        }
-        return Err(format!(
-            "configured default_agent '{}' was not found on PATH",
-            config.default_agent
-        ));
+        return ensure_configured_default_agent(config);
     }
 
     let detected = detected_agents(config);
@@ -411,6 +405,32 @@ pub fn ensure_default_agent(config: &mut Config) -> Result<(), String> {
     config.default_agent = selected.clone();
     save_user_default_agent(config, &selected)?;
     Ok(())
+}
+
+pub fn ensure_default_agent_noninteractive(config: &mut Config) -> Result<(), String> {
+    if config.default_agent != "ask" {
+        return ensure_configured_default_agent(config);
+    }
+
+    let detected = detected_agents(config);
+    if detected.is_empty() {
+        return Err(format!(
+            "no agent backend found; install or configure one of: {}",
+            AGENT_CANDIDATES.join(", ")
+        ));
+    }
+    config.default_agent = detected[0].clone();
+    Ok(())
+}
+
+fn ensure_configured_default_agent(config: &Config) -> Result<(), String> {
+    if agent_command_exists(config, &config.default_agent) {
+        return Ok(());
+    }
+    Err(format!(
+        "configured default_agent '{}' was not found on PATH",
+        config.default_agent
+    ))
 }
 
 fn save_user_default_agent(config: &Config, selected: &str) -> Result<(), String> {

@@ -1,12 +1,45 @@
 use std::env;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Instant;
+
+use crate::observability::{self, LogLevel};
 
 pub fn run_capture(command: &mut Command) -> Result<String, String> {
-    let output = command
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| format!("{command:?}: {error}"))?;
+    let include_argv = observability::enabled(LogLevel::Trace);
+    let command_display = observability::command_display(command);
+    let operation = observability::begin_operation(
+        LogLevel::Debug,
+        "process",
+        "start",
+        "starting subprocess",
+        Some(observability::command_data_json(
+            command,
+            include_argv,
+            None,
+            None,
+            None,
+        )),
+    );
+    let started = Instant::now();
+    let output = command.stderr(Stdio::piped()).output().map_err(|error| {
+        let elapsed_ms = started.elapsed().as_millis() as i64;
+        operation.finish(
+            LogLevel::Error,
+            "process",
+            "error",
+            format!("subprocess failed to start: {error}"),
+            Some(observability::command_data_json(
+                command,
+                include_argv,
+                Some(elapsed_ms),
+                None,
+                Some(&error.to_string()),
+            )),
+        );
+        format!("{command_display}: {error}")
+    })?;
+    let elapsed_ms = started.elapsed().as_millis() as i64;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let message = if stderr.is_empty() {
@@ -14,17 +47,102 @@ pub fn run_capture(command: &mut Command) -> Result<String, String> {
         } else {
             stderr
         };
-        return Err(format!("{command:?}: {message}"));
+        operation.finish(
+            LogLevel::Error,
+            "process",
+            "exit",
+            format!("subprocess failed: {}", output.status),
+            Some(observability::command_data_json(
+                command,
+                include_argv,
+                Some(elapsed_ms),
+                Some(&output.status.to_string()),
+                Some(&message),
+            )),
+        );
+        return Err(format!("{command_display}: {message}"));
     }
+    operation.finish(
+        LogLevel::Debug,
+        "process",
+        "exit",
+        "subprocess exited successfully",
+        Some(observability::command_data_json(
+            command,
+            include_argv,
+            Some(elapsed_ms),
+            Some(&output.status.to_string()),
+            None,
+        )),
+    );
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 pub fn run_status(command: &mut Command) -> Result<(), String> {
-    let status = command.status().map_err(|error| error.to_string())?;
+    let include_argv = observability::enabled(LogLevel::Trace);
+    let command_display = observability::command_display(command);
+    let operation = observability::begin_operation(
+        LogLevel::Debug,
+        "process",
+        "start",
+        "starting subprocess",
+        Some(observability::command_data_json(
+            command,
+            include_argv,
+            None,
+            None,
+            None,
+        )),
+    );
+    let started = Instant::now();
+    let status = command.status().map_err(|error| {
+        let elapsed_ms = started.elapsed().as_millis() as i64;
+        operation.finish(
+            LogLevel::Error,
+            "process",
+            "error",
+            format!("subprocess failed to start: {error}"),
+            Some(observability::command_data_json(
+                command,
+                include_argv,
+                Some(elapsed_ms),
+                None,
+                Some(&error.to_string()),
+            )),
+        );
+        format!("{command_display}: {error}")
+    })?;
+    let elapsed_ms = started.elapsed().as_millis() as i64;
     if status.success() {
+        operation.finish(
+            LogLevel::Debug,
+            "process",
+            "exit",
+            "subprocess exited successfully",
+            Some(observability::command_data_json(
+                command,
+                include_argv,
+                Some(elapsed_ms),
+                Some(&status.to_string()),
+                None,
+            )),
+        );
         Ok(())
     } else {
-        Err(format!("{command:?}: exited with {status}"))
+        operation.finish(
+            LogLevel::Error,
+            "process",
+            "exit",
+            format!("subprocess failed: {status}"),
+            Some(observability::command_data_json(
+                command,
+                include_argv,
+                Some(elapsed_ms),
+                Some(&status.to_string()),
+                None,
+            )),
+        );
+        Err(format!("{command_display}: exited with {status}"))
     }
 }
 

@@ -23,19 +23,26 @@ pub(crate) fn maybe_prompt_startup_setup(repo: &Repository, config: &Config) -> 
         return Ok(());
     }
 
-    let current_branch = current_branch(repo, config)?;
-    let default_base = default_base(repo, config);
-    let worktree_count = worktree_count(repo, config)?;
-    let setup = classify_startup(
-        current_branch.as_deref(),
-        default_base.as_deref(),
-        worktree_count,
-    );
+    let setup = inspect_startup_setup(repo, config)?;
     if !setup.needs_prompt {
         return Ok(());
     }
 
     prompt_setup_loop(repo, config, setup)
+}
+
+pub(crate) fn inspect_startup_setup(
+    repo: &Repository,
+    config: &Config,
+) -> Result<StartupSetup, String> {
+    let current_branch = current_branch(repo, config)?;
+    let default_base = default_base(repo, config);
+    let worktree_count = worktree_count(repo, config)?;
+    Ok(classify_startup(
+        current_branch.as_deref(),
+        default_base.as_deref(),
+        worktree_count,
+    ))
 }
 
 pub(crate) fn classify_startup(

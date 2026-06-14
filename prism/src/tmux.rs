@@ -2,7 +2,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::config::Config;
-use crate::process::split_command_words;
+use crate::process::{run_status, split_command_words};
 use crate::repo::Repository;
 use crate::session::Session;
 use crate::util::safe_branch_filename;
@@ -18,20 +18,15 @@ pub fn attach_or_create_agent(
     }
 
     let command = agent_shell_command(config)?;
-    let status = Command::new(config.tool("tmux"))
-        .env_remove("TMUX")
-        .args(["new-session", "-s"])
-        .arg(&name)
-        .arg("-c")
-        .arg(&session.path)
-        .arg(command)
-        .status()
-        .map_err(|error| format!("tmux new-session: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("tmux new-session exited with {status}"))
-    }
+    run_status(
+        Command::new(config.tool("tmux"))
+            .env_remove("TMUX")
+            .args(["new-session", "-s"])
+            .arg(&name)
+            .arg("-c")
+            .arg(&session.path)
+            .arg(command),
+    )
 }
 
 pub fn agent_session_exists(repo: &Repository, config: &Config, session: &Session) -> bool {
@@ -45,16 +40,11 @@ pub fn agent_session_name(repo: &Repository, branch: &str) -> String {
 }
 
 fn attach(config: &Config, name: &str) -> Result<(), String> {
-    let status = Command::new(config.tool("tmux"))
-        .env_remove("TMUX")
-        .args(["attach-session", "-t", name])
-        .status()
-        .map_err(|error| format!("tmux attach-session: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("tmux attach-session exited with {status}"))
-    }
+    run_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
+        "attach-session",
+        "-t",
+        name,
+    ]))
 }
 
 fn session_exists(config: &Config, name: &str) -> bool {

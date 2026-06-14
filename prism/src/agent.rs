@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::{AGENT_CANDIDATES, Config};
+use crate::observability::{self, LogLevel};
 use crate::process::{command_exists, split_command_words};
 use crate::terminal::{WNOHANG, set_nonblocking};
 use crate::util::timestamp_nanos;
@@ -194,6 +195,13 @@ impl AgentProcess {
         workdir: &Path,
         prompt_file: Option<PathBuf>,
     ) -> Result<Self, String> {
+        let operation = observability::begin_operation(
+            LogLevel::Debug,
+            "agent",
+            "spawn",
+            "starting agent process",
+            Some(observability::agent_spawn_data_json(argv, workdir)),
+        );
         let mut master_fd = 0;
         let pid = unsafe {
             forkpty(
@@ -204,6 +212,13 @@ impl AgentProcess {
             )
         };
         if pid < 0 {
+            operation.finish(
+                LogLevel::Error,
+                "agent",
+                "spawn_error",
+                "forkpty failed",
+                Some(observability::agent_spawn_data_json(argv, workdir)),
+            );
             return Err("forkpty failed".to_string());
         }
         if pid == 0 {
@@ -213,7 +228,23 @@ impl AgentProcess {
             eprintln!("exec {}: {error}", argv[0]);
             std::process::exit(127);
         }
-        set_nonblocking(master_fd)?;
+        if let Err(error) = set_nonblocking(master_fd) {
+            operation.finish(
+                LogLevel::Error,
+                "agent",
+                "spawn_error",
+                format!("set nonblocking failed: {error}"),
+                Some(observability::agent_spawn_data_json(argv, workdir)),
+            );
+            return Err(error);
+        }
+        operation.finish(
+            LogLevel::Debug,
+            "agent",
+            "spawned",
+            format!("agent process started pid={pid}"),
+            Some(observability::agent_spawn_data_json(argv, workdir)),
+        );
         Ok(Self {
             pid,
             master_fd,
