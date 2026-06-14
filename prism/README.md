@@ -59,10 +59,9 @@ and only needed for the temporary `x`/`run-plan` path.
 
 On startup, Prism checks the repository layout before opening the board. If the
 current checkout is not on the default branch, no additional worktree sessions
-are set up yet, or `.config/wt.toml` is missing, Prism shows a setup prompt.
-From that prompt you can open anyway or, on a clean non-default branch checkout,
-add missing Worktrunk config, move the branch into a Worktrunk worktree, and
-switch the original checkout back to the default branch.
+are set up yet, Prism shows a setup prompt. From that prompt you can open anyway
+or, on a clean non-default branch checkout, move the branch into a Worktrunk
+worktree and switch the original checkout back to the default branch.
 
 The TUI supports `c`, `i`/Enter, `n`, `x`, `P`, `R`, `f`, `m`, `u`, `a`, `D`,
 `j`/`k`, arrow keys, `g g`, `G`, `r`, and `q`.

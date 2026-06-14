@@ -1,5 +1,4 @@
 use std::io::{self, Write};
-use std::path::Path;
 use std::process::Command;
 
 use crate::config::Config;
@@ -15,7 +14,6 @@ pub(crate) struct StartupSetup {
     pub current_branch: Option<String>,
     pub default_base: Option<String>,
     pub no_extra_worktrees: bool,
-    pub missing_worktrunk_config: bool,
     pub needs_prompt: bool,
     pub can_move_branch: bool,
 }
@@ -28,39 +26,34 @@ pub(crate) fn maybe_prompt_startup_setup(repo: &Repository, config: &Config) -> 
     let current_branch = current_branch(repo, config)?;
     let default_base = default_base(repo, config);
     let worktree_count = worktree_count(repo, config)?;
-    let worktrunk_config = worktrunk_project_config_path(repo);
     let setup = classify_startup(
         current_branch.as_deref(),
         default_base.as_deref(),
         worktree_count,
-        worktrunk_config.exists(),
     );
     if !setup.needs_prompt {
         return Ok(());
     }
 
-    prompt_setup_loop(repo, config, setup, &worktrunk_config)
+    prompt_setup_loop(repo, config, setup)
 }
 
 pub(crate) fn classify_startup(
     current_branch: Option<&str>,
     default_base: Option<&str>,
     worktree_count: usize,
-    has_worktrunk_config: bool,
 ) -> StartupSetup {
     let on_default_branch = current_branch
         .zip(default_base)
         .map(|(current, base)| current == base)
         .unwrap_or(true);
     let no_extra_worktrees = worktree_count <= 1;
-    let missing_worktrunk_config = !has_worktrunk_config;
     let can_move_branch = !on_default_branch && current_branch.is_some() && default_base.is_some();
     StartupSetup {
         current_branch: current_branch.map(ToString::to_string),
         default_base: default_base.map(ToString::to_string),
         no_extra_worktrees,
-        missing_worktrunk_config,
-        needs_prompt: !on_default_branch || no_extra_worktrees || missing_worktrunk_config,
+        needs_prompt: !on_default_branch || no_extra_worktrees,
         can_move_branch,
     }
 }
@@ -69,7 +62,6 @@ fn prompt_setup_loop(
     repo: &Repository,
     config: &Config,
     setup: StartupSetup,
-    worktrunk_config: &Path,
 ) -> Result<(), String> {
     loop {
         println!();
@@ -83,27 +75,14 @@ fn prompt_setup_loop(
         if setup.no_extra_worktrees {
             println!("No additional worktree sessions are set up yet.");
         }
-        if setup.missing_worktrunk_config {
-            println!(
-                "No Worktrunk project config found at {}.",
-                worktrunk_config.display()
-            );
-        }
         println!();
         if setup.can_move_branch {
             let dirty = worktree_dirty(repo, config)?;
             let branch = setup.current_branch.as_deref().unwrap_or("current branch");
-            let config_prefix = if setup.missing_worktrunk_config {
-                "add Worktrunk config and "
-            } else {
-                ""
-            };
             if dirty {
-                println!(
-                    "  w  {config_prefix}move {branch} to a worktree (requires clean checkout)"
-                );
+                println!("  w  move {branch} to a worktree (requires clean checkout)");
             } else {
-                println!("  w  {config_prefix}move {branch} to a worktree");
+                println!("  w  move {branch} to a worktree");
             }
         }
         println!("  o  open Prism anyway");
@@ -121,7 +100,7 @@ fn prompt_setup_loop(
                     println!("Commit or stash changes, then reopen Prism.");
                     continue;
                 }
-                move_current_branch_to_worktree(repo, config, &setup, worktrunk_config)?;
+                move_current_branch_to_worktree(repo, config, &setup)?;
                 return Ok(());
             }
             _ => {
@@ -131,22 +110,10 @@ fn prompt_setup_loop(
     }
 }
 
-fn create_worktrunk_project_config(repo: &Repository, config: &Config) -> Result<(), String> {
-    run_status(
-        Command::new(config.tool(&config.worktree_command))
-            .arg("-C")
-            .arg(&repo.root)
-            .args(["config", "create", "--project"]),
-    )?;
-    let _ = append_runtime_log(repo, "created Worktrunk project config");
-    Ok(())
-}
-
 fn move_current_branch_to_worktree(
     repo: &Repository,
     config: &Config,
     setup: &StartupSetup,
-    worktrunk_config: &Path,
 ) -> Result<(), String> {
     let branch = setup
         .current_branch
@@ -158,9 +125,6 @@ fn move_current_branch_to_worktree(
         .ok_or_else(|| "default branch is unknown".to_string())?;
     println!();
     println!("This will:");
-    if setup.missing_worktrunk_config {
-        println!("- create {}", worktrunk_config.display());
-    }
     println!("- switch this checkout to {base}");
     println!("- create or switch to a Worktrunk worktree for {branch}");
     println!("- keep your branch and commits intact");
@@ -170,9 +134,6 @@ fn move_current_branch_to_worktree(
         return Ok(());
     }
 
-    if setup.missing_worktrunk_config {
-        create_worktrunk_project_config(repo, config)?;
-    }
     run_status(
         Command::new(config.tool("git"))
             .arg("-C")
@@ -243,10 +204,6 @@ fn worktree_count(repo: &Repository, config: &Config) -> Result<usize, String> {
         .count())
 }
 
-fn worktrunk_project_config_path(repo: &Repository) -> std::path::PathBuf {
-    repo.root.join(".config/wt.toml")
-}
-
 fn read_line() -> Result<String, String> {
     let mut input = String::new();
     io::stdin()
@@ -260,27 +217,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn startup_prompts_for_single_branch_worktree_without_config() {
-        let setup = classify_startup(Some("feature"), Some("main"), 1, false);
+    fn startup_prompts_for_single_branch_worktree() {
+        let setup = classify_startup(Some("feature"), Some("main"), 1);
 
         assert!(setup.needs_prompt);
         assert!(setup.no_extra_worktrees);
-        assert!(setup.missing_worktrunk_config);
         assert!(setup.can_move_branch);
     }
 
     #[test]
-    fn startup_prompts_for_default_branch_without_worktrunk_config() {
-        let setup = classify_startup(Some("main"), Some("main"), 1, false);
+    fn startup_prompts_for_default_branch_without_extra_worktrees() {
+        let setup = classify_startup(Some("main"), Some("main"), 1);
 
         assert!(setup.needs_prompt);
         assert!(!setup.can_move_branch);
-        assert!(setup.missing_worktrunk_config);
     }
 
     #[test]
     fn startup_does_not_prompt_for_configured_multi_worktree_default_checkout() {
-        let setup = classify_startup(Some("main"), Some("main"), 2, true);
+        let setup = classify_startup(Some("main"), Some("main"), 2);
 
         assert!(!setup.needs_prompt);
         assert!(!setup.can_move_branch);
