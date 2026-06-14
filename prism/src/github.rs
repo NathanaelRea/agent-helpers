@@ -836,8 +836,11 @@ mod tests {
     #[test]
     fn fetch_pr_summary_uses_merged_at_instead_of_removed_merged_field() {
         let temp = unique_temp_dir("prism-gh-summary-test");
-        fs::create_dir_all(&temp).unwrap();
-        let gh = temp.join("gh");
+        let bin = temp.join("bin");
+        let repo = temp.join("repo");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let gh = bin.join("gh");
         fs::write(
             &gh,
             r#"#!/bin/sh
@@ -877,7 +880,7 @@ JSON
             .tools
             .insert("gh".to_string(), gh.display().to_string());
 
-        let summary = fetch_pr_summary(&temp, "feature", &config)
+        let summary = fetch_pr_summary(&repo, "feature", &config)
             .unwrap()
             .unwrap()
             .0;
