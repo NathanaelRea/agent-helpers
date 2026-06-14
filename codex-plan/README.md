@@ -1,6 +1,6 @@
 # codex-plan
 
-- Minimal helper for running a plan broken up with phases through `codex exec`, one step at a time.
+- Minimal helper for running a plan broken up with phases through `codex exec`, sequentially by default.
 - Rationale:
   - break large work into focused plan phases
   - minimize unnecessary or potentially misleading context
@@ -10,6 +10,7 @@
   - step name, defaulting to `phase`
   - total step count
   - starting step
+  - whether to run all selected steps in parallel, defaulting to `false`
 - Runs each step as:
 
   ```sh
@@ -21,6 +22,7 @@
   - right pane: current Codex output
   - line cursor and current step status
   - completed steps include the last context/token summary found in Codex output
+  - parallel mode lets you switch between step outputs with tab/right and left/p
 - Supports Vim-style output navigation:
   - `?`: show or hide the shortcuts tooltip
   - `j` / down: move down
@@ -35,7 +37,8 @@
   - diff hunks are shown as one-line summaries until expanded
   - expanded diffs highlight added, deleted, and metadata lines
   - long output is kept in a bounded line buffer with an omission marker when old lines are dropped
-- Falls back to plain sequential output when a TUI is not available.
+- When parallel mode is enabled, starts every selected step at once and reports a failure after all running steps finish.
+- Falls back to plain sequential or prefixed parallel output when a TUI is not available.
 - Install with:
 
   ```sh

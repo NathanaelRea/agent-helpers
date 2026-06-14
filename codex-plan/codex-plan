@@ -238,6 +238,20 @@ class OutputBuffer:
 
 
 @dataclass
+class CodexExecRun:
+    prompt_run: PromptRun
+    pid: int
+    fd: int
+    output: OutputBuffer = field(default_factory=OutputBuffer)
+    returncode: int | None = None
+    next_print_line: int = 1
+
+    @property
+    def task(self) -> str:
+        return self.prompt_run.prompt
+
+
+@dataclass
 class TuiState:
     expanded_blocks: set[str] = field(default_factory=set)
     cursor: int = 0
@@ -283,6 +297,36 @@ def prompt_int(label: str, default: int | None = None) -> int:
             continue
 
         return value
+
+
+def prompt_bool(label: str, default: bool = False) -> bool:
+    default_text = "true" if default else "false"
+    true_values = {"1", "true", "t", "yes", "y", "on"}
+    false_values = {"0", "false", "f", "no", "n", "off"}
+
+    while True:
+        raw = prompt(label, default_text).lower()
+        if raw in true_values:
+            return True
+        if raw in false_values:
+            return False
+        print("Please enter true or false.")
+
+
+def build_task(plan_file: str, step_name: str, step: int) -> str:
+    return f"Implement {plan_file} {step_name} {step}"
+
+
+def build_prompt_runs(
+    plan_file: str,
+    step_name: str,
+    total_steps: int,
+    start_step: int,
+) -> list[PromptRun]:
+    return [
+        PromptRun(build_task(plan_file, step_name, step), step, total_steps)
+        for step in range(start_step, total_steps + 1)
+    ]
 
 
 def list_markdown_files() -> list[str]:
@@ -876,6 +920,48 @@ def toggle_current_block(state: TuiState, lines: list[DisplayLine]) -> None:
     state.follow = False
 
 
+def handle_output_key(
+    key: int,
+    state: TuiState,
+    lines: list[DisplayLine],
+) -> bool:
+    if key == ord("g"):
+        if state.pending_g:
+            move_to_top(state)
+            state.pending_g = False
+            return True
+        state.pending_g = True
+        return False
+
+    state.pending_g = False
+
+    if key == ord("G"):
+        move_to_bottom(state, len(lines))
+        return True
+    if key in (ord("j"), curses.KEY_DOWN):
+        move_cursor(state, len(lines), 1)
+        return True
+    if key in (ord("k"), curses.KEY_UP):
+        move_cursor(state, len(lines), -1)
+        return True
+    if key == ord("}"):
+        move_to_block(state, lines, 1)
+        return True
+    if key == ord("{"):
+        move_to_block(state, lines, -1)
+        return True
+    if key in (ord(" "), ord("\n"), ord("\r"), curses.KEY_ENTER):
+        toggle_current_block(state, lines)
+        return True
+    if key == ord("?"):
+        toggle_help(state)
+        return True
+    if key == curses.KEY_RESIZE:
+        return True
+
+    return False
+
+
 def handle_keys(
     stdscr: curses.window,
     state: TuiState,
@@ -887,40 +973,34 @@ def handle_keys(
         if key == -1:
             return changed
 
-        if key == ord("g"):
-            if state.pending_g:
-                move_to_top(state)
-                state.pending_g = False
-                changed = True
-            else:
-                state.pending_g = True
+        changed = handle_output_key(key, state, lines) or changed
+
+
+def handle_parallel_keys(
+    stdscr: curses.window,
+    states: list[TuiState],
+    selected_index: int,
+    lines: list[DisplayLine],
+) -> tuple[int, bool]:
+    changed = False
+    while True:
+        key = stdscr.getch()
+        if key == -1:
+            return selected_index, changed
+
+        if key in (ord("\t"), curses.KEY_RIGHT, ord("n")) and len(states) > 1:
+            states[selected_index].pending_g = False
+            selected_index = (selected_index + 1) % len(states)
+            changed = True
             continue
 
-        state.pending_g = False
+        if key in (curses.KEY_LEFT, ord("p")) and len(states) > 1:
+            states[selected_index].pending_g = False
+            selected_index = (selected_index - 1) % len(states)
+            changed = True
+            continue
 
-        if key == ord("G"):
-            move_to_bottom(state, len(lines))
-            changed = True
-        elif key in (ord("j"), curses.KEY_DOWN):
-            move_cursor(state, len(lines), 1)
-            changed = True
-        elif key in (ord("k"), curses.KEY_UP):
-            move_cursor(state, len(lines), -1)
-            changed = True
-        elif key == ord("}"):
-            move_to_block(state, lines, 1)
-            changed = True
-        elif key == ord("{"):
-            move_to_block(state, lines, -1)
-            changed = True
-        elif key in (ord(" "), ord("\n"), ord("\r"), curses.KEY_ENTER):
-            toggle_current_block(state, lines)
-            changed = True
-        elif key == ord("?"):
-            toggle_help(state)
-            changed = True
-        elif key == curses.KEY_RESIZE:
-            changed = True
+        changed = handle_output_key(key, states[selected_index], lines) or changed
 
 
 def addstr(window: curses.window, y: int, x: int, text: str, attr: int = 0) -> None:
@@ -958,7 +1038,7 @@ def draw_pane(
         addstr(pane, index + 1, 2, line.text[:body_width], line.attr)
 
 
-def draw_help_overlay(stdscr: curses.window) -> None:
+def draw_help_overlay(stdscr: curses.window, parallel: bool = False) -> None:
     help_lines = [
         "?        show/hide shortcuts",
         "j/down   move down",
@@ -968,6 +1048,11 @@ def draw_help_overlay(stdscr: curses.window) -> None:
         "{ / }    previous/next tool or diff",
         "space    expand/collapse selected block",
     ]
+    if parallel:
+        help_lines[1:1] = [
+            "tab/right next run",
+            "left/p   previous run",
+        ]
     height, width = stdscr.getmaxyx()
     box_width = min(max(len(line) for line in help_lines) + 6, width - 4)
     box_height = min(len(help_lines) + 4, height - 2)
@@ -988,13 +1073,15 @@ def prompt_history_lines(
     runs: list[PromptRun],
     width: int,
     max_lines: int,
+    selected_run_index: int | None = None,
 ) -> list[DisplayLine]:
     if width < 1 or max_lines < 1:
         return []
 
     lines: list[DisplayLine] = []
-    for run in runs:
-        summary = f"{run.step}/{run.total_steps} {run.status}"
+    for index, run in enumerate(runs):
+        marker = "> " if index == selected_run_index else ""
+        summary = f"{marker}{run.step}/{run.total_steps} {run.status}"
         if run.context_summary:
             summary = f"{summary}  {run.context_summary}"
         lines.extend(
@@ -1034,6 +1121,8 @@ def render_tui(
     total_steps: int,
     status: str,
     state: TuiState,
+    selected_run_index: int | None = None,
+    parallel: bool = False,
 ) -> tuple[int, int, list[DisplayLine]]:
     stdscr.erase()
     height, width = stdscr.getmaxyx()
@@ -1050,6 +1139,7 @@ def render_tui(
         runs,
         left_width - 4,
         height - 2,
+        selected_run_index,
     )
     output_view_height = max(1, height - 5)
     output_lines = cached_output_lines(
@@ -1093,12 +1183,12 @@ def render_tui(
         right_x,
         height,
         right_width,
-        "Current output",
+        "Selected output" if parallel else "Current output",
         output_header + visible_output,
         title_attr,
     )
     if state.show_help:
-        draw_help_overlay(stdscr)
+        draw_help_overlay(stdscr, parallel)
     stdscr.refresh()
 
     return output_view_height, max(20, right_width - 4), output_lines
@@ -1166,6 +1256,172 @@ def extract_context_summary(output_text: str) -> str | None:
             text = f"{text[:39]}..."
         return text
     return None
+
+
+def terminal_pty_size() -> tuple[int, int]:
+    size = shutil.get_terminal_size((80, 24))
+    return size.lines, size.columns
+
+
+def tui_output_size(stdscr: curses.window) -> tuple[int, int]:
+    height, width = stdscr.getmaxyx()
+    if height < 8 or width < 48:
+        return max(1, height), max(20, width)
+
+    _, _, _, right_width = layout_dimensions(stdscr)
+    return max(1, height - 5), max(20, right_width - 4)
+
+
+def start_codex_exec_runs(
+    prompt_runs: list[PromptRun],
+    rows: int,
+    cols: int,
+) -> list[CodexExecRun]:
+    exec_runs: list[CodexExecRun] = []
+    for prompt_run in prompt_runs:
+        prompt_run.status = "running"
+        pid, fd = spawn_codex_exec(prompt_run.prompt, rows, cols)
+        exec_runs.append(CodexExecRun(prompt_run, pid, fd))
+    return exec_runs
+
+
+def resize_exec_runs(
+    exec_runs: list[CodexExecRun],
+    rows: int,
+    cols: int,
+) -> None:
+    for exec_run in exec_runs:
+        if exec_run.returncode is None:
+            resize_pty(exec_run.fd, rows, cols)
+
+
+def finalize_exec_run(exec_run: CodexExecRun, wait_status: int) -> None:
+    data = read_pty(exec_run.fd)
+    if data:
+        exec_run.output.append(data)
+    exec_run.output.finish()
+    close_fd(exec_run.fd)
+
+    exec_run.returncode = os.waitstatus_to_exitcode(wait_status)
+    exec_run.prompt_run.context_summary = extract_context_summary(
+        exec_run.output.text()
+    )
+    exec_run.prompt_run.status = (
+        "done" if exec_run.returncode == 0 else f"failed:{exec_run.returncode}"
+    )
+
+
+def finish_completed_runs(exec_runs: list[CodexExecRun]) -> list[CodexExecRun]:
+    completed: list[CodexExecRun] = []
+    for exec_run in exec_runs:
+        if exec_run.returncode is not None:
+            continue
+
+        try:
+            waited_pid, status = os.waitpid(exec_run.pid, os.WNOHANG)
+        except ChildProcessError:
+            continue
+
+        if waited_pid == exec_run.pid:
+            finalize_exec_run(exec_run, status)
+            completed.append(exec_run)
+
+    return completed
+
+
+def interrupt_exec_runs(exec_runs: list[CodexExecRun]) -> list[CodexExecRun]:
+    interrupted = [exec_run for exec_run in exec_runs if exec_run.returncode is None]
+    for exec_run in interrupted:
+        try:
+            os.kill(exec_run.pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
+
+    for exec_run in interrupted:
+        try:
+            os.waitpid(exec_run.pid, 0)
+        except ChildProcessError:
+            pass
+
+        data = read_pty(exec_run.fd)
+        if data:
+            exec_run.output.append(data)
+        exec_run.output.finish()
+        close_fd(exec_run.fd)
+        exec_run.returncode = 130
+        exec_run.prompt_run.context_summary = extract_context_summary(
+            exec_run.output.text()
+        )
+        exec_run.prompt_run.status = "interrupted"
+
+    return interrupted
+
+
+def all_runs_finished(exec_runs: list[CodexExecRun]) -> bool:
+    return all(exec_run.returncode is not None for exec_run in exec_runs)
+
+
+def first_failed_run(exec_runs: list[CodexExecRun]) -> CodexExecRun | None:
+    for exec_run in exec_runs:
+        if exec_run.returncode not in (None, 0):
+            return exec_run
+    return None
+
+
+def emit_plain_output(exec_run: CodexExecRun) -> None:
+    prefix = f"[{exec_run.prompt_run.step}/{exec_run.prompt_run.total_steps}]"
+    for line in exec_run.output.lines:
+        if line.number < exec_run.next_print_line:
+            continue
+        print(f"{prefix} {line.text}", flush=True)
+        exec_run.next_print_line = line.number + 1
+
+
+def run_plan_parallel_plain(
+    plan_file: str,
+    step_name: str,
+    total_steps: int,
+    start_step: int,
+) -> tuple[int, str | None, str]:
+    prompt_runs = build_prompt_runs(plan_file, step_name, total_steps, start_step)
+    rows, cols = terminal_pty_size()
+    exec_runs = start_codex_exec_runs(prompt_runs, rows, cols)
+
+    for exec_run in exec_runs:
+        print(f"\n==> Started {exec_run.task}")
+
+    try:
+        while not all_runs_finished(exec_runs):
+            active = [exec_run for exec_run in exec_runs if exec_run.returncode is None]
+            active_by_fd = {exec_run.fd: exec_run for exec_run in active}
+            if active_by_fd:
+                ready, _, _ = select.select(list(active_by_fd), [], [], 0.1)
+                for fd in ready:
+                    exec_run = active_by_fd.get(fd)
+                    if exec_run is None:
+                        continue
+                    data = read_pty(fd)
+                    if data:
+                        exec_run.output.append(data)
+                        emit_plain_output(exec_run)
+
+            for exec_run in finish_completed_runs(exec_runs):
+                emit_plain_output(exec_run)
+                print(f"\n==> Finished {exec_run.task} ({exec_run.prompt_run.status})")
+    except KeyboardInterrupt:
+        interrupted = interrupt_exec_runs(exec_runs)
+        for exec_run in interrupted:
+            emit_plain_output(exec_run)
+            print(f"\n==> Interrupted {exec_run.task}")
+        failed_task = interrupted[0].task if interrupted else None
+        failed_output = interrupted[0].output.text() if interrupted else ""
+        return 130, failed_task, failed_output
+
+    failed_run = first_failed_run(exec_runs)
+    if failed_run is not None:
+        return failed_run.returncode or 1, failed_run.task, failed_run.output.text()
+
+    return 0, None, ""
 
 
 def run_codex_exec_tui(
@@ -1277,7 +1533,7 @@ def _run_plan_tui(
     runs: list[PromptRun] = []
 
     for step in range(start_step, total_steps + 1):
-        task = f"Implement {plan_file} {step_name} {step}"
+        task = build_task(plan_file, step_name, step)
         current_run = PromptRun(task, step, total_steps, "running")
         runs.append(current_run)
         returncode, output = run_codex_exec_tui(
@@ -1305,6 +1561,138 @@ def print_failure_output(output: str, max_lines: int = 80) -> None:
         print(line, file=sys.stderr)
 
 
+def run_plan_parallel_tui(
+    plan_file: str,
+    step_name: str,
+    total_steps: int,
+    start_step: int,
+) -> tuple[int, str | None, str]:
+    return curses.wrapper(
+        _run_plan_parallel_tui,
+        plan_file,
+        step_name,
+        total_steps,
+        start_step,
+    )
+
+
+def _run_plan_parallel_tui(
+    stdscr: curses.window,
+    plan_file: str,
+    step_name: str,
+    total_steps: int,
+    start_step: int,
+) -> tuple[int, str | None, str]:
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    init_colors()
+    stdscr.nodelay(True)
+
+    prompt_runs = build_prompt_runs(plan_file, step_name, total_steps, start_step)
+    rows, cols = tui_output_size(stdscr)
+    exec_runs = start_codex_exec_runs(prompt_runs, rows, cols)
+    states = [TuiState() for _ in exec_runs]
+    selected_index = 0
+    last_size = (rows, cols)
+    last_screen_size = stdscr.getmaxyx()
+
+    def redraw() -> tuple[int, int, list[DisplayLine]]:
+        selected_run = exec_runs[selected_index]
+        return render_tui(
+            stdscr,
+            selected_run.task,
+            selected_run.output,
+            prompt_runs,
+            selected_run.prompt_run.step,
+            total_steps,
+            selected_run.prompt_run.status,
+            states[selected_index],
+            selected_index,
+            True,
+        )
+
+    rows, cols, rendered_lines = redraw()
+    if (rows, cols) != last_size:
+        resize_exec_runs(exec_runs, rows, cols)
+        last_size = (rows, cols)
+
+    try:
+        while True:
+            screen_size = stdscr.getmaxyx()
+            if screen_size != last_screen_size:
+                last_screen_size = screen_size
+                rows, cols, rendered_lines = redraw()
+                if (rows, cols) != last_size:
+                    resize_exec_runs(exec_runs, rows, cols)
+                    last_size = (rows, cols)
+
+            selected_index, key_changed = handle_parallel_keys(
+                stdscr,
+                states,
+                selected_index,
+                rendered_lines,
+            )
+            if key_changed:
+                rows, cols, rendered_lines = redraw()
+                if (rows, cols) != last_size:
+                    resize_exec_runs(exec_runs, rows, cols)
+                    last_size = (rows, cols)
+
+            active = [exec_run for exec_run in exec_runs if exec_run.returncode is None]
+            active_by_fd = {exec_run.fd: exec_run for exec_run in active}
+            if active_by_fd:
+                ready, _, _ = select.select(
+                    list(active_by_fd),
+                    [],
+                    [],
+                    0 if key_changed else 0.1,
+                )
+            else:
+                ready = []
+
+            output_changed = False
+            for fd in ready:
+                exec_run = active_by_fd.get(fd)
+                if exec_run is None:
+                    continue
+                data = read_pty(fd)
+                if data:
+                    exec_run.output.append(data)
+                    output_changed = True
+
+            completed = finish_completed_runs(exec_runs)
+            if completed:
+                output_changed = True
+
+            if output_changed:
+                rows, cols, rendered_lines = redraw()
+                if (rows, cols) != last_size:
+                    resize_exec_runs(exec_runs, rows, cols)
+                    last_size = (rows, cols)
+
+            if all_runs_finished(exec_runs):
+                rows, cols, rendered_lines = redraw()
+                time.sleep(0.35)
+                failed_run = first_failed_run(exec_runs)
+                if failed_run is not None:
+                    return (
+                        failed_run.returncode or 1,
+                        failed_run.task,
+                        failed_run.output.text(),
+                    )
+                return 0, None, ""
+    except KeyboardInterrupt:
+        interrupted = interrupt_exec_runs(exec_runs)
+        if interrupted:
+            selected_index = prompt_runs.index(interrupted[0].prompt_run)
+        redraw()
+        failed_task = interrupted[0].task if interrupted else None
+        failed_output = interrupted[0].output.text() if interrupted else ""
+        return 130, failed_task, failed_output
+
+
 def main() -> int:
     require_command("fzf")
     require_command("codex")
@@ -1318,25 +1706,43 @@ def main() -> int:
         print("Start step cannot be greater than total steps.", file=sys.stderr)
         return 1
 
+    run_in_parallel = prompt_bool("Run all in parallel", False)
+
     if can_use_tui():
-        returncode, failed_task, failed_output = run_plan_tui(
-            plan_file,
-            step_name,
-            total_steps,
-            start_step,
-        )
+        if run_in_parallel:
+            returncode, failed_task, failed_output = run_plan_parallel_tui(
+                plan_file,
+                step_name,
+                total_steps,
+                start_step,
+            )
+        else:
+            returncode, failed_task, failed_output = run_plan_tui(
+                plan_file,
+                step_name,
+                total_steps,
+                start_step,
+            )
     else:
-        returncode = 0
-        failed_task = None
-        failed_output = ""
-        for step in range(start_step, total_steps + 1):
-            task = f"Implement {plan_file} {step_name} {step}"
-            print(f"\n==> {task}\n")
-            returncode, output = run_codex_exec(task)
-            if returncode != 0:
-                failed_task = task
-                failed_output = output
-                break
+        if run_in_parallel:
+            returncode, failed_task, failed_output = run_plan_parallel_plain(
+                plan_file,
+                step_name,
+                total_steps,
+                start_step,
+            )
+        else:
+            returncode = 0
+            failed_task = None
+            failed_output = ""
+            for step in range(start_step, total_steps + 1):
+                task = build_task(plan_file, step_name, step)
+                print(f"\n==> {task}\n")
+                returncode, output = run_codex_exec(task)
+                if returncode != 0:
+                    failed_task = task
+                    failed_output = output
+                    break
 
     if returncode != 0:
         print_failure_output(failed_output)
