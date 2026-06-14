@@ -149,6 +149,23 @@ pub fn append_agent_log(repo: &Repository, branch: &str, chunk: &str) -> Result<
         .map_err(|error| format!("write agent log: {error}"))
 }
 
+pub fn append_runtime_log(repo: &Repository, message: &str) -> Result<(), String> {
+    let path = repo.prism_dir().join("runtime.log");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("create runtime log dir: {error}"))?;
+    }
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("open runtime log: {error}"))?;
+    writeln!(file, "[{seconds}] {message}").map_err(|error| format!("write runtime log: {error}"))
+}
+
 pub fn remove_logs(repo: &Repository, branch: &str) -> Result<(), String> {
     remove_if_exists(log_path(repo, branch), "agent log")
 }

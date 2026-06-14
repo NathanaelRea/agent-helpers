@@ -21,6 +21,7 @@ Implemented so far:
 - backend prompt delivery modes: `stdin`, `argument`, `temp-file`, and `interactive`
 - live process state display: idle, running, done, failed, needs input, or needs restart
 - lightweight process markers and raw agent logs under `.prism/`
+- persistent TUI status line and action failure log under `.prism/runtime.log`
 - current-branch GitHub pull request detection with a right-side PR panel
 - 10-second PR status/check polling through `gh pr view`
 - cached PR summary refresh under `.prism/pr/`, with detail refresh when comments,
@@ -60,6 +61,14 @@ flow refuses to continue when the selected worktree is dirty.
 
 By default, `c` refuses to create a new worktree if the repository currently has
 uncommitted changes. Start Prism with `--allow-dirty` to bypass that guard.
+When creation is allowed, `c` prompts on the bottom line for `Branch name:`,
+then `Initial prompt (optional):`; it does not open a modal dialog.
+
+Runtime diagnostics:
+
+- `.prism/logs/<branch>.log` stores raw agent output for a branch.
+- `.prism/runtime.log` stores Prism action failures shown in the TUI status line.
+- PR refresh errors are cached and shown in the PR panel.
 
 Review loop keys:
 

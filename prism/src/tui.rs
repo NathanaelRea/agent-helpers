@@ -4,7 +4,7 @@ use crate::agent::AgentState;
 use crate::config::{Config, EscapeKey};
 use crate::input::{Key, KeyInput};
 use crate::repo::Repository;
-use crate::session::Session;
+use crate::session::{Session, append_runtime_log};
 use crate::terminal::{RawTerminal, stdin_is_tty, terminal_size};
 use crate::util::{truncate_line, yes};
 use crate::view;
@@ -20,6 +20,7 @@ pub struct Tui {
     pub(crate) sessions: Vec<Session>,
     pub(crate) selected: usize,
     pub(crate) allow_dirty: bool,
+    status_message: Option<String>,
     mode: Mode,
 }
 
@@ -36,6 +37,7 @@ impl Tui {
             sessions,
             selected: 0,
             allow_dirty,
+            status_message: None,
             mode: Mode::Normal,
         }
     }
@@ -120,37 +122,37 @@ impl Tui {
                     Key::PullRequest => {
                         pending_g = false;
                         if let Err(error) = self.create_or_update_pr() {
-                            self.show_message(&format!("PR action failed: {error}"))?;
+                            self.show_error("PR action failed", &error)?;
                         }
                     }
                     Key::ReviewPacket => {
                         pending_g = false;
                         if let Err(error) = self.refresh_review_packet() {
-                            self.show_message(&format!("review packet failed: {error}"))?;
+                            self.show_error("review packet failed", &error)?;
                         }
                     }
                     Key::ReviewFix => {
                         pending_g = false;
                         if let Err(error) = self.start_review_fix() {
-                            self.show_message(&format!("review fix failed: {error}"))?;
+                            self.show_error("review fix failed", &error)?;
                         }
                     }
                     Key::CommitReviewFix => {
                         pending_g = false;
                         if let Err(error) = self.commit_review_fix() {
-                            self.show_message(&format!("commit failed: {error}"))?;
+                            self.show_error("commit failed", &error)?;
                         }
                     }
                     Key::Push => {
                         pending_g = false;
                         if let Err(error) = self.push_selected_branch() {
-                            self.show_message(&format!("push failed: {error}"))?;
+                            self.show_error("push failed", &error)?;
                         }
                     }
                     Key::CreatePlan => {
                         pending_g = false;
                         if let Err(error) = self.create_plan() {
-                            self.show_message(&format!("plan creation failed: {error}"))?;
+                            self.show_error("plan creation failed", &error)?;
                         }
                     }
                     Key::RunPlan => {
@@ -163,25 +165,25 @@ impl Tui {
                         let _ = io::stdin().read_line(&mut line);
                         raw.resume()?;
                         if let Err(error) = result {
-                            self.show_message(&format!("plan run failed: {error}"))?;
+                            self.show_error("plan run failed", &error)?;
                         }
                     }
                     Key::Create => {
                         pending_g = false;
                         if let Err(error) = self.create_session() {
-                            self.show_message(&format!("create session failed: {error}"))?;
+                            self.show_error("create session failed", &error)?;
                         }
                     }
                     Key::Remove => {
                         pending_g = false;
                         if let Err(error) = self.remove_session_from_board() {
-                            self.show_message(&format!("remove failed: {error}"))?;
+                            self.show_error("remove failed", &error)?;
                         }
                     }
                     Key::Delete => {
                         pending_g = false;
                         if let Err(error) = self.delete_session() {
-                            self.show_message(&format!("delete failed: {error}"))?;
+                            self.show_error("delete failed", &error)?;
                         }
                     }
                     Key::Other => pending_g = false,
@@ -317,13 +319,20 @@ impl Tui {
         }
     }
 
-    pub(crate) fn show_message(&self, message: &str) -> Result<(), String> {
+    pub(crate) fn show_message(&mut self, message: &str) -> Result<(), String> {
+        self.status_message = Some(message.to_string());
         print!(
             "\x1b[{};1H\x1b[2K{}",
             terminal_size().1,
             truncate_line(message, terminal_size().0 as usize)
         );
         io::stdout().flush().map_err(|error| error.to_string())
+    }
+
+    fn show_error(&mut self, context: &str, error: &str) -> Result<(), String> {
+        let message = format!("{context}: {error}");
+        let _ = append_runtime_log(&self.repo, &message);
+        self.show_message(&message)
     }
 
     fn move_down(&mut self) {
@@ -347,6 +356,7 @@ impl Tui {
             &self.sessions,
             self.selected,
             mode_label,
+            self.status_message.as_deref(),
         )
     }
 }
