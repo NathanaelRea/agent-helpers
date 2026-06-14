@@ -93,14 +93,12 @@ fn prompt_setup_loop(
             }
         }
         println!("  o  open Prism anyway");
-        println!("  q  quit");
         print!("Choice [o]: ");
         io::stdout().flush().map_err(|error| error.to_string())?;
 
         let choice = read_line()?.trim().to_ascii_lowercase();
         match choice.as_str() {
             "" | "o" => return Ok(()),
-            "q" => return Err("setup cancelled".to_string()),
             "w" if setup.can_move_branch => {
                 if worktree_dirty(repo, config)? {
                     println!("Cannot move branch while this checkout is dirty.");

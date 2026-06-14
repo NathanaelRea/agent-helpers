@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::PathBuf;
@@ -24,6 +24,10 @@ pub struct Tui {
     pub(crate) pr_poll_tx: Sender<PrPollResult>,
     pub(crate) pr_poll_rx: Receiver<PrPollResult>,
     pub(crate) pr_polls_in_flight: BTreeSet<PrPollKey>,
+    pub(crate) tmux_warmup_tx: Sender<TmuxWarmupResult>,
+    pub(crate) tmux_warmup_rx: Receiver<TmuxWarmupResult>,
+    pub(crate) tmux_warmups_in_flight: BTreeSet<TmuxWarmupKey>,
+    pub(crate) tmux_generations: BTreeMap<TmuxSlotKey, u64>,
     status_message: Option<String>,
 }
 
@@ -38,6 +42,24 @@ pub(crate) struct PrPollResult {
     pub cache: PrCache,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct TmuxSlotKey {
+    pub branch: String,
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct TmuxWarmupKey {
+    pub slot: TmuxSlotKey,
+    pub generation: u64,
+}
+
+pub(crate) struct TmuxWarmupResult {
+    pub key: TmuxWarmupKey,
+    pub running: Option<bool>,
+    pub error: Option<String>,
+}
+
 impl Tui {
     pub fn new(
         repo: Repository,
@@ -46,6 +68,7 @@ impl Tui {
         allow_dirty: bool,
     ) -> Self {
         let (pr_poll_tx, pr_poll_rx) = mpsc::channel();
+        let (tmux_warmup_tx, tmux_warmup_rx) = mpsc::channel();
         Self {
             repo,
             config,
@@ -55,6 +78,10 @@ impl Tui {
             pr_poll_tx,
             pr_poll_rx,
             pr_polls_in_flight: BTreeSet::new(),
+            tmux_warmup_tx,
+            tmux_warmup_rx,
+            tmux_warmups_in_flight: BTreeSet::new(),
+            tmux_generations: BTreeMap::new(),
             status_message: None,
         }
     }
@@ -65,7 +92,7 @@ impl Tui {
         }
 
         let mut raw = RawTerminal::enter()?;
-        self.refresh_tmux_agent_states();
+        self.start_tmux_agent_warmup();
         self.draw()?;
         let mut stdin = io::stdin();
         let mut buffer = [0_u8; 64];
@@ -75,13 +102,14 @@ impl Tui {
 
         loop {
             let agents_changed = self.poll_agents();
+            let tmux_changed = self.poll_tmux_agent_warmup();
             let prs_changed = self.poll_pull_requests(false);
             let current_size = terminal_size();
             let resized = current_size != last_size;
             if resized {
                 last_size = current_size;
             }
-            if agents_changed || prs_changed || resized {
+            if agents_changed || tmux_changed || prs_changed || resized {
                 self.draw()?;
             }
             let count = match stdin.read(&mut buffer) {
@@ -146,7 +174,7 @@ impl Tui {
                     Key::Refresh => {
                         pending_g = false;
                         self.refresh_sessions()?;
-                        self.refresh_tmux_agent_states();
+                        self.start_tmux_agent_warmup();
                         self.poll_pull_requests(true);
                     }
                     Key::PullRequest => {
@@ -250,7 +278,7 @@ impl Tui {
         let result = self.attach_selected_agent_terminal();
         let resume_result = raw.resume();
         self.refresh_sessions()?;
-        self.refresh_tmux_agent_states();
+        self.start_tmux_agent_warmup();
         resume_result?;
         if let Err(error) = result {
             self.show_error("agent terminal failed", &error)?;
@@ -293,7 +321,7 @@ impl Tui {
             });
         let resume_result = raw.resume();
         self.refresh_sessions()?;
-        self.refresh_tmux_agent_states();
+        self.start_tmux_agent_warmup();
         resume_result?;
         result
     }
@@ -318,7 +346,7 @@ impl Tui {
             "j/k, arrows   move selection",
             "g g / G      top / bottom",
             "r            refresh",
-            "q            quit",
+            "Ctrl-C       quit",
             "",
             "Press any key to close",
         ];

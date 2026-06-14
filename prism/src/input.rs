@@ -20,10 +20,10 @@ impl KeyInput {
             match self.state {
                 KeyInputState::Normal => match byte {
                     b'\x1b' => self.state = KeyInputState::Escape,
+                    b'\x03' => keys.push(Key::Quit),
                     b' ' => self.state = KeyInputState::Leader,
                     b'\r' | b'\n' => keys.push(Key::AgentMode),
                     31 => keys.push(Key::Terminal),
-                    b'q' => keys.push(Key::Quit),
                     b'k' => keys.push(Key::Up),
                     b'j' => keys.push(Key::Down),
                     b'G' => keys.push(Key::Bottom),
@@ -109,8 +109,15 @@ mod tests {
     #[test]
     fn key_input_handles_batched_keys() {
         let mut input = KeyInput::default();
-        let keys = input.feed(b"jq");
+        let keys = input.feed(b"j\x03");
         assert!(matches!(keys.as_slice(), [Key::Down, Key::Quit]));
+    }
+
+    #[test]
+    fn key_input_does_not_quit_on_q() {
+        let mut input = KeyInput::default();
+        let keys = input.feed(b"q");
+        assert!(matches!(keys.as_slice(), [Key::Other]));
     }
 
     #[test]
